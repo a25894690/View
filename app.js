@@ -2,9 +2,9 @@
 
 /* =========================================================
  * 影片字幕編輯器
- *  - 左上：影片 + 可直接點擊編輯的字幕
- *  - 左下：時間軸（時間尺 / 字幕軌 / 音軌波形）
- *  - 右側：指定時間改字幕、字幕列表、樣式
+ *  - 左上：影片（可直接點字幕編輯、可畫記）
+ *  - 左下：時間軸（時間尺 / 字幕軌 / 音軌波形，可框選刪除片段）
+ *  - 右側分頁：字幕校對、審片留言、刪除片段
  * ========================================================= */
 
 const $ = (s) => document.querySelector(s);
@@ -18,17 +18,26 @@ const ctx = canvas.getContext('2d');
 const hscroll = $('#hscroll');
 const zoomInput = $('#zoom');
 const listEl = $('#subList');
+const cutListEl = $('#cutList');
+const noteListEl = $('#noteList');
+const noteText = $('#noteText');
 const timeLabel = $('#timeLabel');
 const playBtn = $('#playBtn');
+const drawCanvas = $('#drawCanvas');
+const dctx = drawCanvas.getContext('2d');
 
 const STORAGE_KEY = 'subtitle-editor-v1';
-const MIN_LEN = 0.1;       // 字幕最短長度（秒）
-const DEFAULT_LEN = 2;     // 預設長度（秒）
+const MIN_LEN = 0.1;       // 字幕 / 刪除片段最短長度（秒）
+const DEFAULT_LEN = 2;     // 新字幕預設長度（秒）
 const FRAME = 1 / 30;
 
 const state = {
-  subs: [],                // { id, start, end, text }
-  selectedId: null,
+  subs: [],                // { id, start, end, text, orig? }  orig = 修改前的原文
+  cuts: [],                // { id, start, end }  要刪除的片段（不重疊、已排序）
+  notes: [],               // { id, time, text, thumb, drawn } 審片留言
+  selectedId: null,        // 選取的字幕
+  selCutId: null,          // 選取的刪除片段
+  sel: null,               // 音軌上框選的範圍 { start, end }
   activeId: null,
   duration: 0,
   pps: 64,                 // pixels per second
@@ -37,6 +46,13 @@ const state = {
   peaksRate: 200,          // 每秒幾個 bucket
   audioStatus: 'none',     // none | loading | ready | noaudio | error
   videoName: 'subtitles',
+  skipCuts: true,          // 播放時跳過刪除片段
+  playUntil: null,         // 試聽：播到這個時間就停
+  playSkip: false,         // 試聽時是否跳過刪除片段
+  draft: { time: null },   // 正在寫的留言（time 鎖定）
+  strokes: [],             // 畫記筆畫 [{ color, pts: [[x,y]...] }]，座標 0..1
+  drawMode: false,
+  drawColor: '#ffb800',
   style: {
     size: 5,               // 影片高度的百分比
     pos: 8,                // 距離底部（影片高度百分比）
@@ -49,6 +65,7 @@ const state = {
 };
 let nextId = 1;
 let dirty = true;
+let exporting = null;
 
 /* ---------------- 時間格式 ---------------- */
 
@@ -63,6 +80,15 @@ function fmt(t) {
   const s = Math.floor((ms % 60000) / 1000);
   const r = ms % 1000;
   return (h ? h + ':' : '') + pad(m) + ':' + pad(s) + '.' + pad(r, 3);
+}
+
+/** 短格式：mm:ss.s */
+function fmtShort(t) {
+  if (!isFinite(t) || t < 0) t = 0;
+  const d = Math.round(t * 10);
+  const m = Math.floor(d / 600);
+  const s = (d - m * 600) / 10;
+  return pad(m) + ':' + (s < 10 ? '0' : '') + s.toFixed(1);
 }
 
 /** 字幕檔用：hh:mm:ss,mmm */
@@ -88,7 +114,7 @@ function fmtRuler(t, step) {
  *   83.5 / 1:23.5 / 01:23,500 / 00:01:23.500 / 1分23秒 / 1分23.5秒 / 1小時2分3秒
  */
 function parseTime(input) {
-  let str = String(input ?? '').trim().replace(/：/g, ':').replace(/，/g, ',').replace(',', '.');
+  const str = String(input ?? '').trim().replace(/：/g, ':').replace(/，/g, ',').replace(',', '.');
   if (!str) return NaN;
   const zh = str.match(/^(?:(\d+)\s*(?:小時|時|h))?\s*(?:(\d+)\s*(?:分鐘|分|m))?\s*(?:(\d+(?:\.\d+)?)\s*(?:秒|s)?)?$/i);
   if (zh && (zh[1] || zh[2] || zh[3]) && /[小時分秒hms]/i.test(str)) {
@@ -99,19 +125,22 @@ function parseTime(input) {
   return parts.reduce((acc, p) => acc * 60 + parseFloat(p), 0);
 }
 
-/* ---------------- 復原 / 重做 ---------------- */
+/* ---------------- 復原 / 重做（字幕 + 刪除片段） ---------------- */
 
 const undoStack = [];
 const redoStack = [];
-function snapshot() { return JSON.stringify(state.subs); }
+function snapshot(subs = state.subs) { return JSON.stringify({ subs, cuts: state.cuts }); }
 function pushUndo() {
   undoStack.push(snapshot());
   if (undoStack.length > 200) undoStack.shift();
   redoStack.length = 0;
 }
 function restore(json) {
-  state.subs = JSON.parse(json);
-  if (!state.subs.some((s) => s.id === state.selectedId)) state.selectedId = null;
+  const d = JSON.parse(json);
+  state.subs = d.subs;
+  state.cuts = d.cuts || [];
+  if (!byId(state.selectedId)) state.selectedId = null;
+  if (!cutById(state.selCutId)) state.selCutId = null;
   changed();
 }
 function undo() {
@@ -136,6 +165,13 @@ function subAt(t) {
   return found;
 }
 function maxTime() { return state.duration || Infinity; }
+const isEdited = (s) => s.orig !== undefined && s.orig !== s.text;
+
+/** 改字幕文字，第一次修改時保留原文以便對照 */
+function setText(s, text) {
+  if (s.orig === undefined && s.text !== '' && s.text !== text) s.orig = s.text;
+  s.text = text;
+}
 
 /** 在 t 開始的新字幕預設結束時間：預設長度，但不超過下一條字幕或影片結尾 */
 function defaultEnd(t) {
@@ -154,6 +190,7 @@ function addSub(start, end, text = '', { undoable = true } = {}) {
   state.subs.push(sub);
   sortSubs();
   state.selectedId = sub.id;
+  state.selCutId = null;
   changed();
   return sub;
 }
@@ -172,6 +209,7 @@ function splitAt(t) {
   if (!s || t - s.start < MIN_LEN || s.end - t < MIN_LEN) return toast('目前時間沒有可以分割的字幕');
   pushUndo();
   const tail = { id: nextId++, start: t, end: s.end, text: s.text };
+  if (s.orig !== undefined) tail.orig = s.orig;
   s.end = t;
   state.subs.push(tail);
   sortSubs();
@@ -180,37 +218,280 @@ function splitAt(t) {
   toast('已分割字幕');
 }
 
+/** 字幕校對：從游標位置把一句拆成兩句，時間依字數比例切開 */
+function splitText(s, pos) {
+  const text = s.text;
+  const a = text.slice(0, pos).replace(/\s+$/, '');
+  const b = text.slice(pos).replace(/^\s+/, '');
+  if (!a || !b) return toast('把游標放在句子中間，再按 Ctrl+Enter 拆句');
+  if (s.end - s.start < MIN_LEN * 2) return toast('這句太短，無法再拆');
+  pushUndo();
+  const ratio = [...text.slice(0, pos)].length / [...text].length;
+  const t = Math.min(s.end - MIN_LEN, Math.max(s.start + MIN_LEN, s.start + (s.end - s.start) * ratio));
+  const orig = s.orig ?? text;
+  const tail = { id: nextId++, start: t, end: s.end, text: b, orig };
+  s.end = t;
+  s.text = a;
+  s.orig = orig;
+  state.subs.push(tail);
+  sortSubs();
+  state.selectedId = tail.id;
+  changed();
+  focusItemText(tail.id, 0);
+}
+
+/** 字幕校對：把這句併回上一句 */
+function mergeWithPrev(s) {
+  const i = state.subs.indexOf(s);
+  if (i <= 0) return;
+  const prev = state.subs[i - 1];
+  pushUndo();
+  const latin = (x, y) => /[A-Za-z0-9,.!?]$/.test(x) && /^[A-Za-z0-9]/.test(y) ? ' ' : '';
+  const sep = latin(prev.text, s.text);
+  const caret = prev.text.length + sep.length;
+  const po = prev.orig ?? prev.text;
+  const so = s.orig ?? s.text;
+  // 兩句是同一句拆出來的（原文相同）→ 原文不重複
+  const orig = prev.orig !== undefined && prev.orig === s.orig ? po : po + latin(po, so) + so;
+  prev.text = prev.text + sep + s.text;
+  prev.end = Math.max(prev.end, s.end);
+  if (orig !== prev.text) prev.orig = orig; else delete prev.orig;
+  state.subs.splice(i, 1);
+  state.selectedId = prev.id;
+  changed();
+  focusItemText(prev.id, caret);
+}
+
 /** 資料變動後：存檔、重繪列表與時間軸 */
 function changed({ list = true } = {}) {
   save();
   if (list) renderList();
-  $('#subCount').textContent = state.subs.length ? `(${state.subs.length})` : '';
+  renderCuts();
+  updateCounts();
   state.activeId = -1; // 強制刷新疊加字幕
+  dirty = true;
+}
+
+function updateCounts() {
+  $('#subCount').textContent = state.subs.length || '';
+  $('#cutCount').textContent = state.cuts.length || '';
+  $('#noteCount').textContent = state.notes.length || '';
+  const edited = state.subs.filter(isEdited).length;
+  const eb = $('#editedCount');
+  eb.hidden = !edited;
+  eb.textContent = `${edited} 句已改`;
+}
+
+/* ---------------- 刪除片段 ---------------- */
+
+const cutById = (id) => state.cuts.find((c) => c.id === id);
+function cutAt(t) { return state.cuts.find((c) => t >= c.start - 1e-3 && t < c.end - 0.02); }
+
+/** 合併重疊的片段並排序 */
+function normalizeCuts() {
+  const sorted = [...state.cuts].sort((a, b) => a.start - b.start);
+  const out = [];
+  for (const c of sorted) {
+    const last = out[out.length - 1];
+    if (last && c.start <= last.end + 1e-3) {
+      last.end = Math.max(last.end, c.end);
+      if (state.selCutId === c.id) state.selCutId = last.id;
+    } else out.push(c);
+  }
+  state.cuts = out;
+}
+
+function addCut(start, end) {
+  start = Math.max(0, start);
+  end = Math.min(maxTime(), end);
+  if (end - start < MIN_LEN / 2) return null;
+  pushUndo();
+  const c = { id: nextId++, start, end };
+  state.cuts.push(c);
+  state.selCutId = c.id;
+  normalizeCuts();
+  changed();
+  return c;
+}
+
+function markCut() {
+  if (!video.src) return toast('請先開啟影片');
+  if (!state.sel) return toast('先在下方音軌上拖曳框選要刪除的範圍');
+  const len = state.sel.end - state.sel.start;
+  addCut(state.sel.start, state.sel.end);
+  state.sel = null;
+  updateSelUI();
+  toast(`已標記刪除 ${len.toFixed(1)} 秒`);
+}
+
+function deleteCut(id) {
+  if (!cutById(id)) return;
+  pushUndo();
+  state.cuts = state.cuts.filter((c) => c.id !== id);
+  if (state.selCutId === id) state.selCutId = null;
+  changed();
+}
+
+function cutStats() {
+  const total = state.duration || 0;
+  let removed = 0;
+  for (const c of state.cuts) removed += Math.max(0, Math.min(c.end, total || c.end) - c.start);
+  return { total, removed, after: Math.max(0, total - removed) };
+}
+
+/** 原始時間 → 剪掉刪除片段之後的時間 */
+function mapTime(t) {
+  let d = 0;
+  for (const c of state.cuts) if (t > c.start) d += Math.min(t, c.end) - c.start;
+  return t - d;
+}
+
+function statsText() {
+  const st = cutStats();
+  return `原長 ${fmtShort(st.total)}　刪 ${state.cuts.length} 段共 ${st.removed.toFixed(1)}s　→　剪後 ${fmtShort(st.after)}`;
+}
+
+function renderCuts() {
+  const st = cutStats();
+  $('#cutStats').innerHTML = '';
+  $('#cutStats').append(
+    '原長 ', el('b', { textContent: fmtShort(st.total) }),
+    `　刪 ${state.cuts.length} 段共 ${st.removed.toFixed(1)}s　→　剪後 `,
+    el('b', { textContent: fmtShort(st.after) }),
+  );
+  cutListEl.textContent = '';
+  if (!state.cuts.length) {
+    cutListEl.append(el('div', { className: 'empty-msg', textContent: '還沒有刪除片段。' }));
+    return;
+  }
+  state.cuts.forEach((c, i) => {
+    cutListEl.append(el('div', {
+      className: 'cut-item' + (c.id === state.selCutId ? ' selected' : ''), dataset: { id: c.id },
+    },
+      el('span', { textContent: i + 1 + '.' }),
+      el('span', { className: 'range', textContent: `${fmt(c.start)} — ${fmt(c.end)}` }),
+      el('span', { className: 'len', textContent: (c.end - c.start).toFixed(1) + 's' }),
+      el('span', { className: 'nudge' },
+        el('button', { type: 'button', className: 'mini', textContent: '‹', title: '開始提早 0.1 秒', dataset: { act: 's-' } }),
+        el('button', { type: 'button', className: 'mini', textContent: '›', title: '開始延後 0.1 秒', dataset: { act: 's+' } }),
+        el('button', { type: 'button', className: 'mini', textContent: '‹', title: '結束提早 0.1 秒', dataset: { act: 'e-' } }),
+        el('button', { type: 'button', className: 'mini', textContent: '›', title: '結束延後 0.1 秒', dataset: { act: 'e+' } }),
+      ),
+      el('button', { type: 'button', className: 'mini', textContent: '▶', title: '試聽（前後各 2 秒，跳過這段）', dataset: { act: 'play' } }),
+      el('button', { type: 'button', className: 'mini danger', textContent: '✕', title: '取消這段刪除', dataset: { act: 'del' } }),
+    ));
+  });
+}
+
+function selectCut(id) {
+  state.selCutId = id;
+  if (state.selectedId != null) {
+    listEl.querySelector('.sub-item.selected')?.classList.remove('selected');
+    state.selectedId = null;
+  }
+  cutListEl.querySelectorAll('.cut-item').forEach((it) => it.classList.toggle('selected', +it.dataset.id === id));
+  dirty = true;
+}
+
+cutListEl.addEventListener('click', (e) => {
+  const item = e.target.closest('.cut-item');
+  if (!item) return;
+  const c = cutById(+item.dataset.id);
+  if (!c) return;
+  selectCut(c.id);
+  const act = e.target.dataset.act;
+  if (!act) { seek(c.start); revealTime(c.start); return; }
+  if (act === 'del') return deleteCut(c.id);
+  if (act === 'play') return previewCut(c);
+  pushUndo();
+  const d = act.endsWith('+') ? 0.1 : -0.1;
+  if (act[0] === 's') c.start = Math.max(0, Math.min(c.start + d, c.end - MIN_LEN));
+  else c.end = Math.min(maxTime(), Math.max(c.end + d, c.start + MIN_LEN));
+  normalizeCuts();
+  changed();
+});
+
+$('#clearCuts').addEventListener('click', () => {
+  if (!state.cuts.length) return;
+  if (!confirm(`確定要清除全部 ${state.cuts.length} 個刪除片段？（可以按 Ctrl+Z 復原）`)) return;
+  pushUndo();
+  state.cuts = [];
+  state.selCutId = null;
+  changed();
+});
+
+$('#skipCuts').addEventListener('change', (e) => { state.skipCuts = e.target.checked; save(); });
+
+/* ---- 試聽 ---- */
+
+function playRange(start, end, skip) {
+  if (!video.src) return;
+  seek(start);
+  state.playUntil = end;
+  state.playSkip = skip;
+  video.play();
+}
+function previewCut(c) {
+  playRange(Math.max(0, c.start - 2), Math.min(maxTime(), c.end + 2), true);
+}
+function playSelection() {
+  if (state.sel) return playRange(state.sel.start, state.sel.end, false);
+  const c = cutById(state.selCutId);
+  if (c) return previewCut(c);
+  toast('先在音軌上框選範圍，或選一個刪除片段');
+}
+
+function updateSelUI() {
+  $('#markCutBtn').disabled = !state.sel;
+  $('#playSelBtn').disabled = !state.sel && !cutById(state.selCutId);
   dirty = true;
 }
 
 /* ---------------- 儲存 ---------------- */
 
 let saveTimer = 0;
+let warnedQuota = false;
 function save() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
+    const data = { subs: state.subs, cuts: state.cuts, notes: state.notes, style: state.style, skipCuts: state.skipCuts };
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ subs: state.subs, style: state.style }));
-    } catch (e) { /* 無法存取 localStorage 時忽略 */ }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {
+      // 截圖太多存不下時，至少把文字存起來
+      try {
+        data.notes = state.notes.map((n) => ({ ...n, thumb: '' }));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        if (!warnedQuota) { warnedQuota = true; toast('瀏覽器空間不足，留言截圖不會被保存（文字有保存）'); }
+      } catch (e2) { /* 無法存取 localStorage 時忽略 */ }
+    }
   }, 300);
 }
 function load() {
   try {
     const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
     if (!data) return;
+    const num = (x) => isFinite(x) && x !== null;
     if (Array.isArray(data.subs)) {
-      state.subs = data.subs
-        .filter((s) => isFinite(s.start) && isFinite(s.end))
-        .map((s) => ({ id: nextId++, start: +s.start, end: +s.end, text: String(s.text ?? '') }));
+      state.subs = data.subs.filter((s) => num(s.start) && num(s.end)).map((s) => {
+        const o = { id: nextId++, start: +s.start, end: +s.end, text: String(s.text ?? '') };
+        if (typeof s.orig === 'string') o.orig = s.orig;
+        return o;
+      });
       sortSubs();
     }
+    if (Array.isArray(data.cuts)) {
+      state.cuts = data.cuts.filter((c) => num(c.start) && num(c.end) && c.end > c.start)
+        .map((c) => ({ id: nextId++, start: +c.start, end: +c.end }));
+      normalizeCuts();
+    }
+    if (Array.isArray(data.notes)) {
+      state.notes = data.notes.filter((n) => num(n.time)).map((n) => ({
+        id: nextId++, time: +n.time, text: String(n.text ?? ''), thumb: String(n.thumb || ''), drawn: !!n.drawn,
+      }));
+    }
     if (data.style) Object.assign(state.style, data.style);
+    if (typeof data.skipCuts === 'boolean') state.skipCuts = data.skipCuts;
   } catch (e) { /* ignore */ }
 }
 
@@ -231,13 +512,15 @@ function renderList() {
   const scrollTop = listEl.scrollTop;
   listEl.textContent = '';
   if (!state.subs.length) {
-    listEl.append(el('div', { className: 'empty-msg', textContent: '還沒有字幕。播放影片到想要的位置，按「＋ 新增字幕」或直接點影片上的提示框。' }));
+    listEl.append(el('div', { className: 'empty-msg', textContent: '還沒有字幕。播放影片到想要的位置，按「＋ 字幕」或直接點影片上的提示框；也可以匯入 SRT / VTT。' }));
     return;
   }
   const frag = document.createDocumentFragment();
   state.subs.forEach((s, i) => {
+    const edited = isEdited(s);
     const item = el('div', {
-      className: 'sub-item' + (s.id === state.selectedId ? ' selected' : '') + (s.id === state.activeId ? ' active' : ''),
+      className: 'sub-item' + (s.id === state.selectedId ? ' selected' : '') +
+        (s.id === state.activeId ? ' active' : '') + (edited ? ' edited' : ''),
       dataset: { id: s.id },
     },
       el('div', { className: 'row' },
@@ -251,17 +534,34 @@ function renderList() {
         el('button', { type: 'button', className: 'mini', title: '跳到這句', textContent: '▶', dataset: { act: 'jump' } }),
         el('button', { type: 'button', className: 'mini danger', title: '刪除', textContent: '✕', dataset: { act: 'del' } }),
       ),
-      el('textarea', { rows: 1, value: s.text, placeholder: '輸入字幕…', dataset: { field: 'text' } }),
+      el('textarea', {
+        rows: 1, value: s.text, placeholder: '輸入字幕…', dataset: { field: 'text' },
+        title: 'Ctrl/⌘+Enter：從游標處拆句　句首 Backspace：併回上一句',
+      }),
+      el('div', { className: 'orig', textContent: s.orig ?? '', hidden: !edited, title: '修改前的原文' }),
     );
     frag.append(item);
   });
   listEl.append(frag);
+  listEl.querySelectorAll('textarea').forEach(autoGrow);
   listEl.scrollTop = scrollTop;
 }
 
 function itemEl(id) { return listEl.querySelector(`.sub-item[data-id="${id}"]`); }
 
+/** 只更新某一條的「已修改」顯示，不重繪整個列表 */
+function refreshEdited(s) {
+  const it = itemEl(s.id);
+  if (!it) return;
+  const edited = isEdited(s);
+  it.classList.toggle('edited', edited);
+  const o = it.querySelector('.orig');
+  o.hidden = !edited;
+  o.textContent = s.orig ?? '';
+}
+
 function select(id, { scroll = true } = {}) {
+  if (state.selCutId != null) selectCut(null);
   if (state.selectedId === id) return;
   listEl.querySelector('.sub-item.selected')?.classList.remove('selected');
   state.selectedId = id;
@@ -281,7 +581,7 @@ listEl.addEventListener('click', (e) => {
   if (!s) return;
   select(id, { scroll: false });
   const act = e.target.dataset.act;
-  if (act === 'jump') seek(s.start + 0.001);
+  if (act === 'jump') { seek(s.start + 0.001); revealTime(s.start); }
   else if (act === 'del') deleteSub(id);
   else if (act === 'setStart') setEdge(s, 'start', video.currentTime);
   else if (act === 'setEnd') setEdge(s, 'end', video.currentTime);
@@ -298,8 +598,9 @@ listEl.addEventListener('input', (e) => {
   const s = byId(+e.target.closest('.sub-item').dataset.id);
   if (!s) return;
   if (textEditPending) { pushUndo(); textEditPending = false; }
-  s.text = e.target.value;
+  setText(s, e.target.value);
   autoGrow(e.target);
+  refreshEdited(s);
   changed({ list: false });
 });
 listEl.addEventListener('change', (e) => {
@@ -316,7 +617,18 @@ listEl.addEventListener('change', (e) => {
   setEdge(s, field, t);
 });
 listEl.addEventListener('keydown', (e) => {
-  if (e.target.matches('input.t') && e.key === 'Enter') e.target.blur();
+  if (e.target.matches('input.t') && e.key === 'Enter') { e.target.blur(); return; }
+  if (e.target.dataset.field !== 'text' || e.isComposing) return;
+  const s = byId(+e.target.closest('.sub-item').dataset.id);
+  if (!s) return;
+  const ta = e.target;
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    splitText(s, ta.selectionStart);
+  } else if (e.key === 'Backspace' && ta.selectionStart === 0 && ta.selectionEnd === 0 && state.subs.indexOf(s) > 0) {
+    e.preventDefault();
+    mergeWithPrev(s);
+  }
 });
 
 function setEdge(s, field, t) {
@@ -335,6 +647,7 @@ function setEdge(s, field, t) {
 }
 
 function autoGrow(ta) {
+  if (!ta.offsetParent) return; // 隱藏中的分頁量不到高度
   ta.style.height = 'auto';
   ta.style.height = ta.scrollHeight + 2 + 'px';
 }
@@ -360,7 +673,7 @@ $('#quickForm').addEventListener('submit', (e) => {
   const existing = subAt(start + 0.0005);
   if (existing) {
     pushUndo();
-    existing.text = text;
+    setText(existing, text);
     if (isFinite(end)) { existing.start = start; existing.end = end; sortSubs(); }
     state.selectedId = existing.id;
     changed();
@@ -370,6 +683,7 @@ $('#quickForm').addEventListener('submit', (e) => {
     toast(`已在 ${fmt(s.start)} 新增字幕`);
   }
   seek(start + 0.001);
+  revealTime(start);
   itemEl(state.selectedId)?.scrollIntoView({ block: 'nearest' });
   $('#qText').value = '';
   endIn.value = '';
@@ -397,13 +711,12 @@ function updateOverlay() {
       if (!video.paused && !listEl.contains(document.activeElement)) it.scrollIntoView({ block: 'nearest' });
     }
     overlay.textContent = s.text;
-    overlay.classList.remove('empty', 'hidden');
-    overlay.classList.toggle('hidden', s.text === '');
-    if (s.text === '' && video.paused) overlay.classList.remove('hidden');
+    overlay.classList.remove('empty');
+    overlay.classList.toggle('hidden', s.text === '' && !video.paused);
   } else {
     overlay.textContent = '';
     overlay.classList.add('empty');
-    overlay.classList.toggle('hidden', !video.paused || !video.src);
+    overlay.classList.toggle('hidden', !video.paused || !video.src || state.drawMode);
   }
 }
 
@@ -415,13 +728,12 @@ function applyOverlayStyle() {
   overlay.style.color = st.color;
   overlay.style.fontWeight = st.bold ? '700' : '400';
   overlay.style.backgroundColor = hexA(st.bg, st.bgA);
-  overlay.style.webkitTextStroke = '0';
   overlay.style.textShadow = st.outline
     ? '0 0 2px #000, 0 0 2px #000, 1px 1px 2px #000, -1px -1px 2px #000'
     : 'none';
 }
 
-/** 讓字幕層剛好蓋在影片實際畫面上（扣掉黑邊） */
+/** 讓字幕層、畫記層剛好蓋在影片實際畫面上（扣掉黑邊） */
 function layoutOverlay() {
   const cw = player.clientWidth;
   const ch = player.clientHeight;
@@ -430,14 +742,18 @@ function layoutOverlay() {
   const scale = Math.min(cw / vw, ch / vh);
   const w = vw * scale;
   const h = vh * scale;
-  Object.assign(subLayer.style, {
-    left: (cw - w) / 2 + 'px', top: (ch - h) / 2 + 'px', width: w + 'px', height: h + 'px',
-  });
+  const rect = { left: (cw - w) / 2 + 'px', top: (ch - h) / 2 + 'px', width: w + 'px', height: h + 'px' };
+  Object.assign(subLayer.style, rect);
+  Object.assign(drawCanvas.style, rect);
+  const dpr = window.devicePixelRatio || 1;
+  drawCanvas.width = Math.max(1, Math.round(w * dpr));
+  drawCanvas.height = Math.max(1, Math.round(h * dpr));
   applyOverlayStyle();
+  redrawStrokes();
 }
 
 overlay.addEventListener('focus', () => {
-  if (!video.src) { overlay.blur(); return; }
+  if (!video.src || state.drawMode) { overlay.blur(); return; }
   video.pause();
   let s = subAt(video.currentTime);
   overlayCreated = false;
@@ -456,9 +772,10 @@ overlay.addEventListener('input', () => {
   const s = byId(overlayEditId);
   if (!s) return;
   if (overlayUndoPending) { pushUndo(); overlayUndoPending = false; }
-  s.text = overlay.innerText.replace(/\n$/, '');
+  setText(s, overlay.innerText.replace(/\n$/, ''));
   const ta = itemEl(s.id)?.querySelector('textarea');
   if (ta) { ta.value = s.text; autoGrow(ta); }
+  refreshEdited(s);
   changed({ list: false });
 });
 
@@ -493,11 +810,288 @@ overlay.addEventListener('blur', () => {
   updateOverlay();
 });
 
+/* ---------------- 畫記 ---------------- */
+
+let curStroke = null;
+
+function paintStrokes(c, w, h, strokes = state.strokes) {
+  c.lineCap = 'round';
+  c.lineJoin = 'round';
+  c.lineWidth = Math.max(2, Math.min(w, h) * 0.008);
+  for (const st of strokes) {
+    if (!st.pts.length) continue;
+    c.strokeStyle = st.color;
+    c.beginPath();
+    c.moveTo(st.pts[0][0] * w, st.pts[0][1] * h);
+    for (const p of st.pts) c.lineTo(p[0] * w, p[1] * h);
+    if (st.pts.length === 1) c.lineTo(st.pts[0][0] * w + 0.1, st.pts[0][1] * h);
+    c.stroke();
+  }
+}
+
+function redrawStrokes() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = drawCanvas.width / dpr;
+  const h = drawCanvas.height / dpr;
+  dctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  dctx.clearRect(0, 0, w, h);
+  paintStrokes(dctx, w, h);
+  drawCanvas.classList.toggle('show', state.drawMode || state.strokes.length > 0);
+}
+
+function setDrawMode(on) {
+  if (on && !video.src) return toast('請先開啟影片');
+  state.drawMode = on;
+  player.classList.toggle('drawing', on);
+  $('#drawBar').hidden = !on;
+  $('#drawBtn').classList.toggle('on', on);
+  $('#drawBtn2').classList.toggle('on', on);
+  if (on) {
+    video.pause();
+    overlay.blur();
+    switchTab('review');
+  }
+  state.activeId = -1;
+  redrawStrokes();
+}
+
+function normPt(e) {
+  const r = drawCanvas.getBoundingClientRect();
+  return [
+    Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+    Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+  ];
+}
+
+drawCanvas.addEventListener('pointerdown', (e) => {
+  if (!state.drawMode) return;
+  e.preventDefault();
+  drawCanvas.setPointerCapture(e.pointerId);
+  lockDraft();
+  curStroke = { color: state.drawColor, pts: [normPt(e)] };
+  state.strokes.push(curStroke);
+  redrawStrokes();
+});
+drawCanvas.addEventListener('pointermove', (e) => {
+  if (!curStroke) return;
+  curStroke.pts.push(normPt(e));
+  redrawStrokes();
+});
+const endStroke = () => { curStroke = null; updateNoteHead(); };
+drawCanvas.addEventListener('pointerup', endStroke);
+drawCanvas.addEventListener('pointercancel', endStroke);
+
+$('#drawBar').addEventListener('click', (e) => {
+  const sw = e.target.closest('.swatch');
+  if (!sw) return;
+  state.drawColor = sw.dataset.color;
+  document.querySelectorAll('.swatch').forEach((b) => b.classList.toggle('active', b === sw));
+});
+$('#drawUndo').addEventListener('click', () => { state.strokes.pop(); redrawStrokes(); updateNoteHead(); });
+$('#drawClear').addEventListener('click', () => { state.strokes = []; redrawStrokes(); updateNoteHead(); });
+$('#drawDone').addEventListener('click', () => { setDrawMode(false); noteText.focus(); });
+$('#drawBtn').addEventListener('click', () => setDrawMode(!state.drawMode));
+$('#drawBtn2').addEventListener('click', () => setDrawMode(!state.drawMode));
+
+/* ---------------- 審片留言 ---------------- */
+
+function lockDraft() {
+  if (state.draft.time != null) return;
+  video.pause();
+  state.draft.time = video.currentTime;
+  updateNoteHead();
+}
+
+let lastNoteHead = '';
+function updateNoteHead() {
+  const locked = state.draft.time != null;
+  const t = locked ? state.draft.time : video.currentTime;
+  const label = '⏱ ' + fmt(t) + (locked ? 'L' : '') + state.strokes.length;
+  if (label === lastNoteHead) return;
+  lastNoteHead = label;
+  $('#noteTime').textContent = '⏱ ' + fmt(t);
+  $('#noteLock').hidden = !locked;
+  $('#noteHint').textContent = state.strokes.length ? `已畫 ${state.strokes.length} 筆，會跟留言一起送出` : '';
+}
+
+noteText.addEventListener('input', () => { if (noteText.value.trim()) lockDraft(); });
+noteText.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); addNote(); }
+});
+
+function resetDraft() {
+  state.draft.time = null;
+  noteText.value = '';
+  state.strokes = [];
+  if (state.drawMode) setDrawMode(false);
+  redrawStrokes();
+  updateNoteHead();
+}
+$('#noteClear').addEventListener('click', resetDraft);
+
+function seekTo(t) {
+  return new Promise((resolve) => {
+    if (Math.abs(video.currentTime - t) < 0.001 && !video.seeking && video.readyState >= 2) return resolve();
+    video.addEventListener('seeked', () => resolve(), { once: true });
+    video.currentTime = t;
+  });
+}
+
+/** 擷取目前畫面（含畫記）做縮圖 */
+function captureThumb() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return '';
+  const scale = 360 / Math.max(vw, vh);
+  const w = Math.round(vw * scale);
+  const h = Math.round(vh * scale);
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const cx = c.getContext('2d');
+  try {
+    cx.drawImage(video, 0, 0, w, h);
+    paintStrokes(cx, w, h);
+    return c.toDataURL('image/jpeg', 0.75);
+  } catch (e) {
+    return '';
+  }
+}
+
+async function addNote() {
+  if (!video.src) return toast('請先開啟影片');
+  const text = noteText.value.trim();
+  if (!text && !state.strokes.length) return toast('先輸入修改意見');
+  const t = state.draft.time ?? video.currentTime;
+  video.pause();
+  await seekTo(t);
+  const note = { id: nextId++, time: t, text, thumb: captureThumb(), drawn: state.strokes.length > 0 };
+  state.notes.push(note);
+  state.notes.sort((a, b) => a.time - b.time);
+  resetDraft();
+  renderNotes();
+  updateCounts();
+  save();
+  toast(`已加入 ${fmtShort(t)} 的留言`);
+}
+$('#noteAdd').addEventListener('click', addNote);
+
+function renderNotes() {
+  noteListEl.textContent = '';
+  if (!state.notes.length) {
+    noteListEl.append(el('div', { className: 'empty-msg', textContent: '暫停在要改的地方，在上面打意見後按「加入留言」，就會排在這裡。' }));
+    return;
+  }
+  for (const n of state.notes) {
+    noteListEl.append(el('div', { className: 'note-item' + (n.drawn ? ' drawn' : ''), dataset: { id: n.id } },
+      n.thumb ? el('img', { src: n.thumb, alt: '', title: '跳到這個時間', dataset: { act: 'seek' } }) : '',
+      el('div', { className: 'body' },
+        el('div', { className: 'meta' },
+          el('span', { className: 'time', textContent: fmtShort(n.time), title: '跳到這個時間', dataset: { act: 'seek' } }),
+          n.drawn ? el('span', { className: 'tag', textContent: '✏ 畫記' }) : '',
+          el('span', { className: 'spacer' }),
+          el('button', { type: 'button', className: 'mini danger', textContent: '✕', title: '刪除這則留言', dataset: { act: 'del' } }),
+        ),
+        el('div', { className: 'text', textContent: n.text || '（見畫記）' }),
+      ),
+    ));
+  }
+}
+
+noteListEl.addEventListener('click', (e) => {
+  const item = e.target.closest('.note-item');
+  if (!item) return;
+  const n = state.notes.find((x) => x.id === +item.dataset.id);
+  if (!n) return;
+  const act = e.target.dataset.act;
+  if (act === 'seek') { video.pause(); seek(n.time); revealTime(n.time); }
+  else if (act === 'del') {
+    state.notes = state.notes.filter((x) => x !== n);
+    renderNotes();
+    updateCounts();
+    save();
+  }
+});
+
+/** 審片意見文字（給 Claude Code 或剪輯師） */
+function reviewText({ images }) {
+  const L = [`# 審片意見：${state.videoName}`, ''];
+  L.push('## 修改清單', '');
+  if (state.notes.length) {
+    state.notes.forEach((n, i) => L.push(`${i + 1}. [${fmtShort(n.time)}] — ${n.text || '（見附圖）'}${n.drawn ? '（有附圖）' : ''}`));
+  } else L.push('（無）');
+
+  if (state.cuts.length) {
+    L.push('', '## 刪除片段', '');
+    state.cuts.forEach((c, i) => L.push(`${i + 1}. ${fmt(c.start)} — ${fmt(c.end)}（${(c.end - c.start).toFixed(1)}s）`));
+    L.push('', statsText());
+  }
+
+  const edited = state.subs.filter(isEdited);
+  if (edited.length) {
+    L.push('', '## 字幕修改', '');
+    edited.forEach((s, i) => L.push(`${i + 1}. [${fmtShort(s.start)} — ${fmtShort(s.end)}] 「${s.orig}」→「${s.text}」`));
+  }
+
+  if (images) {
+    const withImg = state.notes.filter((n) => n.thumb);
+    if (withImg.length) {
+      L.push('', '## 附圖', '');
+      withImg.forEach((n) => {
+        const i = state.notes.indexOf(n) + 1;
+        L.push(`### ${i}. [${fmtShort(n.time)}] ${n.text || ''}`.trim(), '', `![${fmtShort(n.time)}](${n.thumb})`, '');
+      });
+    }
+  } else if (state.notes.some((n) => n.drawn)) {
+    L.push('', '（有附圖的留言，圖片在匯出的 .md 檔裡）');
+  }
+  return L.join('\n') + '\n';
+}
+
+function hasReview() {
+  return state.notes.length || state.cuts.length || state.subs.some(isEdited);
+}
+
+$('#exportMd').addEventListener('click', () => {
+  if (!hasReview()) return toast('還沒有任何留言、刪除片段或字幕修改');
+  download(new Blob([reviewText({ images: true })], { type: 'text/markdown;charset=utf-8' }), `${state.videoName}_review.md`);
+});
+
+$('#copyReview').addEventListener('click', async () => {
+  if (!hasReview()) return toast('還沒有任何留言、刪除片段或字幕修改');
+  const ok = await copyText(reviewText({ images: false }));
+  toast(ok ? '已複製，貼到 Claude Code 跟他說「照審片意見改」' : '複製失敗，請改用「匯出審片意見」');
+});
+
+async function copyText(t) {
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch (e) {
+    const ta = el('textarea', { value: t });
+    Object.assign(ta.style, { position: 'fixed', opacity: '0', top: '0' });
+    document.body.append(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e2) { /* ignore */ }
+    ta.remove();
+    return ok;
+  }
+}
+
+/* ---------------- 右側分頁 ---------------- */
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach((p) => { p.hidden = p.dataset.panel !== name; });
+  if (name === 'subs') listEl.querySelectorAll('textarea').forEach(autoGrow);
+}
+document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
 /* ---------------- 時間軸 ---------------- */
 
 const RULER_H = 24;
 const SUB_H = 46;
-const LABEL_W = 0;
 let tlW = 0;
 let tlH = 0;
 
@@ -513,9 +1107,9 @@ function resizeCanvas() {
   dirty = true;
 }
 
-const xOf = (t) => (t - state.scroll) * state.pps + LABEL_W;
-const tOf = (x) => (x - LABEL_W) / state.pps + state.scroll;
-const viewSecs = () => (tlW - LABEL_W) / state.pps;
+const xOf = (t) => (t - state.scroll) * state.pps;
+const tOf = (x) => x / state.pps + state.scroll;
+const viewSecs = () => tlW / state.pps;
 
 function clampScroll() {
   const max = Math.max(0, state.duration - viewSecs() * 0.9);
@@ -525,6 +1119,16 @@ function clampScroll() {
   hscroll.disabled = max <= 0;
 }
 
+/** 讓某個時間出現在時間軸畫面裡 */
+function revealTime(t) {
+  const x = xOf(t);
+  if (x < 0 || x > tlW) {
+    state.scroll = t - viewSecs() * 0.2;
+    clampScroll();
+    dirty = true;
+  }
+}
+
 /** zoom slider（0..900）↔ pixels per second（1..512，指數刻度） */
 const ppsFromSlider = (v) => Math.pow(2, v / 100);
 const sliderFromPps = (p) => Math.round(Math.log2(p) * 100);
@@ -532,7 +1136,7 @@ const sliderFromPps = (p) => Math.round(Math.log2(p) * 100);
 function setZoom(pps, anchorX = tlW / 2) {
   const anchorT = tOf(anchorX);
   state.pps = Math.max(1, Math.min(512, pps));
-  state.scroll = anchorT - (anchorX - LABEL_W) / state.pps;
+  state.scroll = anchorT - anchorX / state.pps;
   zoomInput.value = String(sliderFromPps(state.pps));
   clampScroll();
   dirty = true;
@@ -541,7 +1145,7 @@ function setZoom(pps, anchorX = tlW / 2) {
 function fitZoom() {
   if (!state.duration) return;
   state.scroll = 0;
-  setZoom((tlW - LABEL_W - 20) / state.duration, 0);
+  setZoom((tlW - 20) / state.duration, 0);
 }
 
 function niceStep(minSecs) {
@@ -593,6 +1197,7 @@ function draw() {
   ctx.fillStyle = '#9097a6';
   ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
   ctx.textBaseline = 'top';
+  ctx.lineWidth = 1;
   ctx.beginPath();
   for (let t = Math.floor(t0 / minor) * minor; t <= t1; t += minor) {
     const x = Math.round(xOf(t)) + 0.5;
@@ -660,7 +1265,7 @@ function draw() {
     roundRect(ctx, x + 0.5, RULER_H + 5.5, w - 1, SUB_H - 11, 4);
     ctx.fillStyle = sel ? '#52b67f' : '#2f6b4b';
     ctx.fill();
-    ctx.strokeStyle = sel ? '#bff5d6' : '#4c9a70';
+    ctx.strokeStyle = sel ? '#bff5d6' : isEdited(s) ? '#ff8a3d' : '#4c9a70';
     ctx.lineWidth = 1;
     ctx.stroke();
     if (w > 14) {
@@ -675,12 +1280,59 @@ function draw() {
     }
   }
 
-  // 拖曳中的新增範圍提示 / 左側軌道名稱
+  // 刪除片段
+  for (const c of state.cuts) {
+    if (c.end < t0 || c.start > t1) continue;
+    const x0 = xOf(c.start);
+    const w = Math.max(2, (c.end - c.start) * state.pps);
+    const sel = c.id === state.selCutId;
+    ctx.fillStyle = sel ? 'rgba(255,77,79,.45)' : 'rgba(255,77,79,.3)';
+    ctx.fillRect(x0, RULER_H, w, H - RULER_H);
+    ctx.fillStyle = '#ff4d4f';
+    ctx.fillRect(x0, RULER_H - 4, w, 4);
+    ctx.strokeStyle = sel ? '#ffd0d1' : '#ff4d4f';
+    ctx.lineWidth = sel ? 2 : 1;
+    ctx.strokeRect(x0 + 0.5, audioY + 0.5, w - 1, audioH - 1);
+    if (w > 30) {
+      ctx.fillStyle = '#ffd0d1';
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`刪 ${(c.end - c.start).toFixed(1)}s`, x0 + 4, audioY + 4);
+    }
+  }
+
+  // 框選範圍
+  if (state.sel) {
+    const x0 = xOf(state.sel.start);
+    const w = Math.max(1, (state.sel.end - state.sel.start) * state.pps);
+    ctx.fillStyle = 'rgba(255,214,0,.18)';
+    ctx.fillRect(x0, RULER_H, w, H - RULER_H);
+    ctx.strokeStyle = '#ffd600';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, RULER_H + 0.5, w - 1, H - RULER_H - 1);
+    ctx.fillStyle = '#ffd600';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`${(state.sel.end - state.sel.start).toFixed(2)}s　按 X 刪除`, x0 + 4, audioY + 4);
+  }
+
+  // 軌道名稱
   ctx.font = '10px system-ui, sans-serif';
   ctx.textBaseline = 'top';
   ctx.fillStyle = 'rgba(144,151,166,.7)';
   ctx.fillText('字幕', 4, RULER_H + 2);
-  ctx.fillText('音訊', 4, audioY + 2);
+  ctx.fillText(state.sel || state.cuts.length ? '音訊' : '音訊（拖曳框選 → X 刪除）', 4, audioY + audioH - 14);
+
+  // 留言標記
+  for (const n of state.notes) {
+    const x = xOf(n.time);
+    if (x < -6 || x > W + 6) continue;
+    ctx.fillStyle = '#b6ff3b';
+    ctx.beginPath();
+    ctx.moveTo(x - 5, RULER_H - 9); ctx.lineTo(x + 5, RULER_H - 9); ctx.lineTo(x, RULER_H - 2);
+    ctx.closePath();
+    ctx.fill();
+  }
 
   // 播放頭
   const px = Math.round(xOf(video.currentTime || 0)) + 0.5;
@@ -703,8 +1355,14 @@ function canvasPos(e) {
   return { x: e.clientX - r.left, y: e.clientY - r.top };
 }
 
+function region(y) {
+  if (y < RULER_H) return 'ruler';
+  if (y <= RULER_H + SUB_H) return 'subs';
+  return 'audio';
+}
+
 function hitSub(x, y) {
-  if (y < RULER_H || y > RULER_H + SUB_H) return null;
+  if (region(y) !== 'subs') return null;
   // 優先判斷選取中的字幕
   const ordered = [...state.subs].sort((a, b) => (a.id === state.selectedId) - (b.id === state.selectedId)).reverse();
   for (const s of ordered) {
@@ -732,10 +1390,13 @@ canvas.addEventListener('pointerdown', (e) => {
   if (!video.src) return;
   canvas.setPointerCapture(e.pointerId);
   const { x, y } = canvasPos(e);
+  const reg = region(y);
   const hit = hitSub(x, y);
   if (hit) {
     select(hit.sub.id);
     drag = { kind: 'sub', ...hit, startX: x, origStart: hit.sub.start, origEnd: hit.sub.end, moved: false, undo: false };
+  } else if (reg === 'audio') {
+    drag = { kind: 'select', startX: x, t0: Math.max(0, tOf(x)), moved: false };
   } else {
     drag = { kind: 'scrub' };
     seek(tOf(x));
@@ -746,7 +1407,9 @@ canvas.addEventListener('pointermove', (e) => {
   const { x, y } = canvasPos(e);
   if (!drag) {
     const hit = hitSub(x, y);
-    canvas.style.cursor = hit ? (hit.mode === 'move' ? 'grab' : 'ew-resize') : (video.src ? 'text' : 'default');
+    canvas.style.cursor = !video.src ? 'default'
+      : hit ? (hit.mode === 'move' ? 'grab' : 'ew-resize')
+        : region(y) === 'audio' ? 'crosshair' : 'text';
     return;
   }
   if (drag.kind === 'scrub') {
@@ -754,10 +1417,19 @@ canvas.addEventListener('pointermove', (e) => {
     autoScrollEdge(x);
     return;
   }
+  if (drag.kind === 'select') {
+    if (!drag.moved && Math.abs(x - drag.startX) < 3) return;
+    drag.moved = true;
+    autoScrollEdge(x);
+    const t = Math.max(0, Math.min(maxTime(), tOf(x)));
+    state.sel = { start: Math.min(drag.t0, t), end: Math.max(drag.t0, t) };
+    updateSelUI();
+    return;
+  }
   const dx = x - drag.startX;
   if (!drag.moved && Math.abs(dx) < 3) return;
   if (!drag.undo) {
-    undoStack.push(JSON.stringify(state.subs.map((s) => s === drag.sub ? { ...s, start: drag.origStart, end: drag.origEnd } : s)));
+    undoStack.push(snapshot(state.subs.map((s) => s === drag.sub ? { ...s, start: drag.origStart, end: drag.origEnd } : s)));
     redoStack.length = 0;
     drag.undo = true;
   }
@@ -793,6 +1465,16 @@ function endDrag() {
     } else {
       seek(drag.sub.start + 0.001);
     }
+  } else if (drag.kind === 'select' && !drag.moved) {
+    // 在音軌上單擊：點到刪除片段就選取它，否則清除框選並跳到該時間
+    const c = state.cuts.find((k) => drag.t0 >= k.start && drag.t0 <= k.end);
+    state.sel = null;
+    if (c) {
+      selectCut(c.id);
+      cutListEl.querySelector(`.cut-item[data-id="${c.id}"]`)?.scrollIntoView({ block: 'nearest' });
+    } else if (state.selCutId != null) selectCut(null);
+    seek(drag.t0);
+    updateSelUI();
   }
   drag = null;
 }
@@ -805,7 +1487,7 @@ canvas.addEventListener('dblclick', (e) => {
   const hit = hitSub(x, y);
   if (hit) {
     focusItemText(hit.sub.id);
-  } else if (y >= RULER_H && y <= RULER_H + SUB_H) {
+  } else if (region(y) === 'subs') {
     const t = Math.max(0, tOf(x));
     const s = addSub(t, defaultEnd(t), '');
     seek(t + 0.001);
@@ -839,6 +1521,7 @@ function autoScrollEdge(x) {
   if (x > tlW - 20) state.scroll += 10 / state.pps;
   else if (x < 20) state.scroll -= 10 / state.pps;
   clampScroll();
+  dirty = true;
 }
 
 /** 播放時讓播放頭保持在畫面內 */
@@ -858,10 +1541,14 @@ function syncItemTimes(s) {
   if (document.activeElement !== b) b.value = fmt(s.end);
 }
 
-function focusItemText(id) {
+function focusItemText(id, caret) {
+  switchTab('subs');
   select(id);
   const ta = itemEl(id)?.querySelector('textarea');
-  if (ta) { ta.focus(); ta.select(); }
+  if (!ta) return;
+  ta.focus();
+  if (caret == null) ta.select();
+  else ta.setSelectionRange(caret, caret);
 }
 
 /* ---------------- 音軌波形 ---------------- */
@@ -928,7 +1615,9 @@ function loadVideo(file) {
   videoURL = URL.createObjectURL(file);
   state.videoName = file.name.replace(/\.[^.]+$/, '') || 'subtitles';
   state.duration = 0;
+  state.sel = null;
   video.src = videoURL;
+  video.playbackRate = +$('#rate').value;
   document.body.classList.add('has-video');
   document.title = file.name + ' - 影片字幕編輯器';
   computePeaks(file);
@@ -939,6 +1628,7 @@ video.addEventListener('loadedmetadata', () => {
   layoutOverlay();
   resizeCanvas();
   fitZoom();
+  renderCuts();
   state.activeId = -1;
   dirty = true;
 });
@@ -973,6 +1663,7 @@ async function loadSubFile(file) {
   }
   sortSubs();
   changed();
+  switchTab('subs');
   toast(`已匯入 ${subs.length} 條字幕`);
 }
 
@@ -991,6 +1682,7 @@ player.addEventListener('dragover', (e) => { e.preventDefault(); player.classLis
 player.addEventListener('dragleave', () => player.classList.remove('dragover'));
 player.addEventListener('drop', (e) => {
   e.preventDefault();
+  e.stopPropagation();
   player.classList.remove('dragover');
   handleFiles(e.dataTransfer.files);
 });
@@ -1009,22 +1701,32 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
-function toSRT() {
-  return state.subs.map((s, i) =>
+/** 有刪除片段時，詢問要不要把字幕時間對齊剪後的影片 */
+function subsForExport() {
+  if (!state.cuts.length) return state.subs;
+  const align = confirm(`目前有 ${state.cuts.length} 個刪除片段。\n\n要把字幕時間對齊「剪掉之後」的影片嗎？\n確定 = 對齊剪後影片（搭配「輸出含字幕影片」）\n取消 = 保留原始影片的時間`);
+  if (!align) return state.subs;
+  return state.subs
+    .map((s) => ({ ...s, start: mapTime(s.start), end: mapTime(s.end) }))
+    .filter((s) => s.end - s.start >= 0.05);
+}
+
+function toSRT(list = state.subs) {
+  return list.map((s, i) =>
     `${i + 1}\n${fmtFile(s.start, ',')} --> ${fmtFile(s.end, ',')}\n${s.text}\n`).join('\n');
 }
-function toVTT() {
-  return 'WEBVTT\n\n' + state.subs.map((s) =>
+function toVTT(list = state.subs) {
+  return 'WEBVTT\n\n' + list.map((s) =>
     `${fmtFile(s.start, '.')} --> ${fmtFile(s.end, '.')}\n${s.text}\n`).join('\n');
 }
 
 $('#exportSrt').addEventListener('click', () => {
   if (!state.subs.length) return toast('還沒有字幕可以匯出');
-  download(new Blob(['﻿' + toSRT()], { type: 'application/x-subrip;charset=utf-8' }), state.videoName + '.srt');
+  download(new Blob(['﻿' + toSRT(subsForExport())], { type: 'application/x-subrip;charset=utf-8' }), state.videoName + '.srt');
 });
 $('#exportVtt').addEventListener('click', () => {
   if (!state.subs.length) return toast('還沒有字幕可以匯出');
-  download(new Blob([toVTT()], { type: 'text/vtt;charset=utf-8' }), state.videoName + '.vtt');
+  download(new Blob([toVTT(subsForExport())], { type: 'text/vtt;charset=utf-8' }), state.videoName + '.vtt');
 });
 
 /* ---------------- 輸出含字幕（燒錄）影片 ---------------- */
@@ -1082,11 +1784,11 @@ function drawSubtitle(c, text, W, H) {
 }
 
 let audioGraph = null;
-let exporting = null;
 
 async function exportBurned() {
   if (!video.src || !video.videoWidth) return toast('請先開啟影片');
   if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return toast('這個瀏覽器不支援輸出影片，請改用 Chrome / Edge / Firefox');
+  if (state.drawMode) setDrawMode(false);
 
   const W = video.videoWidth;
   const H = video.videoHeight;
@@ -1123,41 +1825,75 @@ async function exportBurned() {
   const status = $('#exportStatus');
   modal.hidden = false;
   prog.value = 0;
-  exporting = { cancelled: false };
+  exporting = { cancelled: false, done: false };
+  const job = exporting;
 
   const wasMuted = video.muted;
   const wasRate = video.playbackRate;
   video.pause();
+  state.playUntil = null;
   video.muted = false;
   video.playbackRate = 1;
-  await new Promise((r) => { video.addEventListener('seeked', r, { once: true }); video.currentTime = 0; });
+  await seekTo(0);
 
+  const outTotal = cutStats().after || state.duration;
   const drawFrame = () => {
     c.drawImage(video, 0, 0, W, H);
     const s = subAt(video.currentTime);
     if (s) drawSubtitle(c, s.text, W, H);
-    const p = state.duration ? video.currentTime / state.duration : 0;
+    const outT = mapTime(video.currentTime);
+    const p = outTotal ? Math.min(1, outT / outTotal) : 0;
     prog.value = p;
-    status.textContent = `${Math.floor(p * 100)}%　${fmt(video.currentTime)} / ${fmt(state.duration)}`;
+    status.textContent = `${Math.floor(p * 100)}%　${fmt(outT)} / ${fmt(outTotal)}`;
   };
 
   const done = new Promise((resolve) => {
     rec.onstop = resolve;
-    const loop = () => {
-      if (exporting.cancelled || video.ended) {
-        drawFrame();
-        if (rec.state !== 'inactive') rec.stop();
-        return;
-      }
+    const finish = () => {
+      if (job.done) return;
+      job.done = true;
       drawFrame();
+      if (rec.state !== 'inactive') rec.stop();
+    };
+    const schedule = () => {
       if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(loop);
       else requestAnimationFrame(loop);
     };
+    // 碰到刪除片段：暫停錄影 → 跳過 → 繼續
+    const jumpOver = async (cut) => {
+      video.pause();
+      if (rec.state === 'recording') rec.pause();
+      if (cut.end >= state.duration - 0.05) return finish();
+      await seekTo(cut.end);
+      if (job.cancelled) return finish();
+      drawFrame();
+      if (rec.state === 'paused') rec.resume();
+      try { await video.play(); } catch (e) { job.cancelled = true; return finish(); }
+      schedule();
+    };
+    function loop() {
+      if (job.done) return;
+      if (job.cancelled || video.ended) return finish();
+      const cut = cutAt(video.currentTime);
+      if (cut) { jumpOver(cut); return; }
+      drawFrame();
+      schedule();
+    }
     // 影片結束時 requestVideoFrameCallback 不會再觸發，用 ended 事件保底
-    video.addEventListener('ended', () => setTimeout(loop, 50), { once: true });
-    drawFrame();
-    rec.start(1000);
-    video.play().then(loop).catch((err) => { console.warn(err); exporting.cancelled = true; loop(); });
+    video.addEventListener('ended', function onEnd() {
+      video.removeEventListener('ended', onEnd);
+      setTimeout(finish, 50);
+    });
+
+    const start = async () => {
+      const first = cutAt(0);
+      if (first) await seekTo(first.end);
+      drawFrame();
+      rec.start(1000);
+      try { await video.play(); } catch (e) { console.warn(e); job.cancelled = true; return finish(); }
+      schedule();
+    };
+    start();
   });
 
   await done;
@@ -1165,9 +1901,8 @@ async function exportBurned() {
   video.muted = wasMuted;
   video.playbackRate = wasRate;
   modal.hidden = true;
-  const cancelled = exporting.cancelled;
   exporting = null;
-  if (cancelled) return toast('已取消輸出');
+  if (job.cancelled) return toast('已取消輸出');
   const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
   download(new Blob(chunks, { type: mimeType || 'video/webm' }), `${state.videoName}_subtitled.${ext}`);
   toast('輸出完成！');
@@ -1186,7 +1921,10 @@ function seek(t) {
 }
 function togglePlay() {
   if (!video.src) return;
-  if (video.paused) video.play(); else video.pause();
+  if (video.paused) {
+    if (state.drawMode) setDrawMode(false);
+    video.play();
+  } else video.pause();
 }
 function addAtCurrent() {
   if (!video.src) return toast('請先開啟影片');
@@ -1201,10 +1939,18 @@ function addAtCurrent() {
 playBtn.addEventListener('click', togglePlay);
 video.addEventListener('click', togglePlay);
 video.addEventListener('play', () => { playBtn.textContent = '❚❚'; state.activeId = -1; });
-video.addEventListener('pause', () => { playBtn.textContent = '▶'; state.activeId = -1; dirty = true; });
+video.addEventListener('pause', () => {
+  playBtn.textContent = '▶';
+  if (!exporting) state.playUntil = null;
+  state.activeId = -1;
+  dirty = true;
+});
 video.addEventListener('seeked', () => { dirty = true; });
+$('#rate').addEventListener('change', (e) => { if (!exporting) video.playbackRate = +e.target.value; });
 $('#addSubBtn').addEventListener('click', addAtCurrent);
 $('#splitBtn').addEventListener('click', () => splitAt(video.currentTime));
+$('#markCutBtn').addEventListener('click', markCut);
+$('#playSelBtn').addEventListener('click', playSelection);
 $('#undoBtn').addEventListener('click', undo);
 $('#redoBtn').addEventListener('click', redo);
 $('#clearBtn').addEventListener('click', () => {
@@ -1219,8 +1965,9 @@ $('#clearBtn').addEventListener('click', () => {
 /* ---- 快捷鍵 ---- */
 
 document.addEventListener('keydown', (e) => {
+  if (exporting) return;
   const tag = e.target.tagName;
-  const typing = tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable;
+  const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target.isContentEditable;
   const mod = e.ctrlKey || e.metaKey;
 
   if (mod && e.key.toLowerCase() === 'z' && !typing) {
@@ -1231,7 +1978,11 @@ document.addEventListener('keydown', (e) => {
   if (mod && e.key.toLowerCase() === 'y' && !typing) { e.preventDefault(); redo(); return; }
   if (e.key === 'Escape') {
     document.querySelectorAll('.modal:not(#exportModal)').forEach((m) => (m.hidden = true));
-    if (typing) e.target.blur();
+    if (typing) { e.target.blur(); return; }
+    if (state.drawMode) setDrawMode(false);
+    state.sel = null;
+    if (state.selCutId != null) selectCut(null);
+    updateSelUI();
     return;
   }
   if (typing || mod || e.altKey) return;
@@ -1245,9 +1996,15 @@ document.addEventListener('keydown', (e) => {
     case '.': video.pause(); seek(video.currentTime + FRAME); break;
     case 'n': case 'N': e.preventDefault(); addAtCurrent(); break;
     case 's': case 'S': splitAt(video.currentTime); break;
+    case 'x': case 'X': markCut(); break;
+    case 'p': case 'P': playSelection(); break;
+    case 'd': case 'D': setDrawMode(!state.drawMode); break;
     case '[': if (sel) setEdge(sel, 'start', video.currentTime); break;
     case ']': if (sel) setEdge(sel, 'end', video.currentTime); break;
-    case 'Delete': case 'Backspace': if (sel) { e.preventDefault(); deleteSub(sel.id); } break;
+    case 'Delete': case 'Backspace':
+      if (state.selCutId != null) { e.preventDefault(); deleteCut(state.selCutId); }
+      else if (sel) { e.preventDefault(); deleteSub(sel.id); }
+      break;
     default: return;
   }
 });
@@ -1259,7 +2016,6 @@ const styleInputs = {
   bgA: $('#stBgA'), outline: $('#stOutline'), bold: $('#stBold'),
 };
 for (const [k, inp] of Object.entries(styleInputs)) {
-  if (inp.type === 'checkbox') inp.checked = !!state.style[k];
   inp.addEventListener('input', () => {
     state.style[k] = inp.type === 'checkbox' ? inp.checked : inp.type === 'range' ? +inp.value : inp.value;
     applyOverlayStyle();
@@ -1285,7 +2041,7 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2400);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
 
 new ResizeObserver(() => { resizeCanvas(); }).observe(canvas);
@@ -1296,12 +2052,24 @@ new ResizeObserver(() => { layoutOverlay(); }).observe(player);
 let lastLabel = '';
 function tick() {
   const playing = !video.paused;
+  if (playing && !exporting) {
+    const t = video.currentTime;
+    if (state.playUntil != null && t >= state.playUntil) {
+      video.pause();
+      state.playUntil = null;
+    } else {
+      const skip = state.playUntil != null ? state.playSkip : state.skipCuts;
+      const c = skip && cutAt(t);
+      if (c) video.currentTime = Math.min(c.end, state.duration);
+    }
+  }
   if (playing && !drag) followPlayhead();
   if (playing || dirty) {
     draw();
     dirty = false;
   }
   updateOverlay();
+  updateNoteHead();
   const label = fmt(video.currentTime) + ' / ' + fmt(state.duration);
   if (label !== lastLabel) { timeLabel.textContent = label; lastLabel = label; }
   requestAnimationFrame(tick);
@@ -1311,11 +2079,15 @@ function tick() {
 
 load();
 syncStyleInputs();
+$('#skipCuts').checked = state.skipCuts;
 renderList();
-$('#subCount').textContent = state.subs.length ? `(${state.subs.length})` : '';
+renderCuts();
+renderNotes();
+updateCounts();
+updateSelUI();
 resizeCanvas();
 layoutOverlay();
 requestAnimationFrame(tick);
 
 // 方便測試 / 除錯
-window.__editor = { state, parseTime, parseSubs, toSRT, toVTT, fmt };
+window.__editor = { state, parseTime, parseSubs, toSRT, toVTT, fmt, mapTime, reviewText, cutStats };

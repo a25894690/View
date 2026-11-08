@@ -33,13 +33,40 @@
           <div class="sub-overlay" id="subOverlay" contenteditable="true" spellcheck="false"
                data-placeholder="點這裡在目前時間新增字幕"></div>
         </div>
+        <canvas class="draw-layer" id="drawCanvas"></canvas>
+        <div class="draw-bar" id="drawBar" hidden>
+          <span>直接在畫面上圈：</span>
+          <button class="swatch active" data-color="#ffb800" style="--c:#ffb800" title="黃"></button>
+          <button class="swatch" data-color="#b6ff3b" style="--c:#b6ff3b" title="綠"></button>
+          <button class="swatch" data-color="#ff4d4f" style="--c:#ff4d4f" title="紅"></button>
+          <button class="swatch" data-color="#ffffff" style="--c:#ffffff" title="白"></button>
+          <button class="btn small" id="drawUndo">↶ 復原</button>
+          <button class="btn small" id="drawClear">清除</button>
+          <button class="btn small primary" id="drawDone">✓ 畫完了</button>
+        </div>
       </div>
 
       <div class="transport">
         <button id="playBtn" class="btn icon" title="播放 / 暫停 (空白鍵)">▶</button>
         <span id="timeLabel" class="time">00:00.000 / 00:00.000</span>
-        <button class="btn" id="addSubBtn" title="N">＋ 新增字幕</button>
-        <button class="btn" id="splitBtn" title="S">✂ 分割</button>
+        <button class="btn" id="addSubBtn" title="N">＋ 字幕</button>
+        <button class="btn" id="splitBtn" title="S">✂ 分割字幕</button>
+        <span class="sep"></span>
+        <button class="btn" id="markCutBtn" title="在音軌上框選後按 X">🗑 標記刪除 <kbd>X</kbd></button>
+        <button class="btn" id="playSelBtn" title="P">▶ 試聽選取</button>
+        <span class="sep"></span>
+        <button class="btn" id="drawBtn" title="D">✏ 畫記</button>
+        <label class="rate">倍速
+          <select id="rate">
+            <option value="0.5">0.5×</option>
+            <option value="0.75">0.75×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.1">1.1×</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+          </select>
+        </label>
         <span class="spacer"></span>
         <label class="zoom">縮放 <input type="range" id="zoom" min="0" max="900" value="600"></label>
       </div>
@@ -50,52 +77,103 @@
       </div>
     </section>
 
-    <!-- 右側：字幕編輯 -->
+    <!-- 右側：分頁 -->
     <aside class="right">
-      <form class="quick" id="quickForm" autocomplete="off">
-        <h2>指定時間改字幕</h2>
-        <div class="qrow">
-          <label>開始
-            <span class="tin"><input id="qStart" placeholder="例 1:23.5 或 1分23秒" required>
-            <button type="button" class="mini" data-now="qStart" title="填入目前時間">⏱</button></span>
-          </label>
-          <label>結束 <small>(可留空)</small>
-            <span class="tin"><input id="qEnd" placeholder="預設 +2 秒">
-            <button type="button" class="mini" data-now="qEnd" title="填入目前時間">⏱</button></span>
-          </label>
-        </div>
-        <textarea id="qText" rows="2" placeholder="字幕要改成什麼…" required></textarea>
-        <div class="qrow end">
-          <span class="hint">該時間已有字幕 → 改內容；沒有 → 新增</span>
-          <button class="btn primary" type="submit">套用</button>
-        </div>
-      </form>
+      <nav class="tabs">
+        <button class="tab active" data-tab="subs">字幕 <span class="badge" id="subCount"></span></button>
+        <button class="tab" data-tab="review">審片留言 <span class="badge" id="noteCount"></span></button>
+        <button class="tab" data-tab="cuts">刪除片段 <span class="badge" id="cutCount"></span></button>
+      </nav>
 
-      <div class="list-head">
-        <h2>字幕列表 <span id="subCount" class="count"></span></h2>
-        <button class="btn ghost small" id="clearBtn">清除全部</button>
-      </div>
-      <div class="sub-list" id="subList"></div>
+      <!-- 字幕 -->
+      <section class="tab-panel" data-panel="subs">
+        <form class="quick" id="quickForm" autocomplete="off">
+          <h2>指定時間改字幕</h2>
+          <div class="qrow">
+            <label>開始
+              <span class="tin"><input id="qStart" placeholder="例 1:23.5 或 1分23秒" required>
+              <button type="button" class="mini" data-now="qStart" title="填入目前時間">⏱</button></span>
+            </label>
+            <label>結束 <small>(可留空)</small>
+              <span class="tin"><input id="qEnd" placeholder="預設 +2 秒">
+              <button type="button" class="mini" data-now="qEnd" title="填入目前時間">⏱</button></span>
+            </label>
+          </div>
+          <textarea id="qText" rows="2" placeholder="字幕要改成什麼…" required></textarea>
+          <div class="qrow end">
+            <span class="hint">該時間已有字幕 → 改內容；沒有 → 新增</span>
+            <button class="btn primary" type="submit">套用</button>
+          </div>
+        </form>
 
-      <details class="style-box">
-        <summary>字幕樣式</summary>
-        <div class="grid">
-          <label>字體大小 <input type="range" id="stSize" min="2" max="12" step="0.5"></label>
-          <label>距離底部 <input type="range" id="stPos" min="0" max="80" step="1"></label>
-          <label>文字顏色 <input type="color" id="stColor"></label>
-          <label>背景顏色 <input type="color" id="stBg"></label>
-          <label>背景透明度 <input type="range" id="stBgA" min="0" max="1" step="0.05"></label>
-          <label>描邊 <input type="checkbox" id="stOutline"></label>
-          <label>粗體 <input type="checkbox" id="stBold"></label>
+        <div class="list-head">
+          <h2>字幕校對 <span id="editedCount" class="edited-badge" hidden></span></h2>
+          <span class="hint" title="在字幕框裡：Ctrl/⌘+Enter 從游標處拆成兩句；在句首按 Backspace 併回上一句">Ctrl+Enter 拆句</span>
+          <button class="btn ghost small" id="clearBtn">清除全部</button>
         </div>
-      </details>
+        <div class="sub-list" id="subList"></div>
+
+        <details class="style-box">
+          <summary>字幕樣式</summary>
+          <div class="grid">
+            <label>字體大小 <input type="range" id="stSize" min="2" max="12" step="0.5"></label>
+            <label>距離底部 <input type="range" id="stPos" min="0" max="80" step="1"></label>
+            <label>文字顏色 <input type="color" id="stColor"></label>
+            <label>背景顏色 <input type="color" id="stBg"></label>
+            <label>背景透明度 <input type="range" id="stBgA" min="0" max="1" step="0.05"></label>
+            <label>描邊 <input type="checkbox" id="stOutline"></label>
+            <label>粗體 <input type="checkbox" id="stBold"></label>
+          </div>
+        </details>
+      </section>
+
+      <!-- 審片留言 -->
+      <section class="tab-panel" data-panel="review" hidden>
+        <div class="note-form">
+          <div class="note-head">
+            <span id="noteTime" class="note-time">⏱ 00:00.000</span>
+            <span id="noteLock" class="lock" hidden>🔒 已鎖定</span>
+            <span class="spacer"></span>
+            <button class="btn small" id="drawBtn2">✏ 畫記</button>
+          </div>
+          <textarea id="noteText" rows="3" placeholder="暫停在要改的畫面，在這裡打修改意見…&#10;（一開始打字或畫記，時間就會鎖定）"></textarea>
+          <div class="qrow end">
+            <span class="hint" id="noteHint"></span>
+            <span class="btns">
+              <button class="btn ghost small" id="noteClear">清空</button>
+              <button class="btn primary" id="noteAdd">＋ 加入留言</button>
+            </span>
+          </div>
+        </div>
+        <div class="list-head"><h2>修改清單</h2></div>
+        <div class="note-list" id="noteList"></div>
+        <div class="export-row">
+          <button class="btn accent" id="exportMd">📥 匯出審片意見 (.md)</button>
+          <button class="btn" id="copyReview">複製文字</button>
+        </div>
+      </section>
+
+      <!-- 刪除片段 -->
+      <section class="tab-panel" data-panel="cuts" hidden>
+        <div class="cut-help">
+          在下方<b>音軌波形上拖曳框選</b>不要的段落（例如沒講話的空白），按 <kbd>X</kbd> 標記刪除。
+          框完可以先按「▶ 試聽選取」聽一下。
+        </div>
+        <label class="check"><input type="checkbox" id="skipCuts" checked> 播放時跳過刪除片段（預覽剪後效果）</label>
+        <div class="stats" id="cutStats"></div>
+        <div class="list-head">
+          <h2>刪除片段</h2>
+          <button class="btn ghost small" id="clearCuts">全部清除</button>
+        </div>
+        <div class="cut-list" id="cutList"></div>
+      </section>
     </aside>
   </main>
 
   <div class="modal" id="exportModal" hidden>
     <div class="dialog">
       <h3>正在輸出含字幕影片…</h3>
-      <p class="muted">影片會以正常速度播放一遍並錄製，請保持此分頁在前景。</p>
+      <p class="muted">影片會以正常速度播放一遍並錄製（會自動跳過刪除片段），請保持此分頁在前景。</p>
       <progress id="exportProgress" max="1" value="0"></progress>
       <div id="exportStatus" class="muted">0%</div>
       <button class="btn" id="exportCancel">取消</button>
@@ -111,13 +189,18 @@
         <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>上一格 / 下一格畫面</td></tr>
         <tr><td><kbd>N</kbd></td><td>在目前時間新增字幕</td></tr>
         <tr><td><kbd>S</kbd></td><td>在目前時間分割字幕</td></tr>
+        <tr><td><kbd>X</kbd></td><td>把音軌上框選的範圍標記為刪除</td></tr>
+        <tr><td><kbd>P</kbd></td><td>試聽選取範圍 / 選取的刪除片段</td></tr>
+        <tr><td><kbd>D</kbd></td><td>開關畫記模式</td></tr>
         <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>把選取字幕的開始 / 結束設為目前時間</td></tr>
-        <tr><td><kbd>Delete</kbd></td><td>刪除選取的字幕</td></tr>
+        <tr><td><kbd>Delete</kbd></td><td>刪除選取的字幕或刪除片段</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>取消選取 / 離開畫記</td></tr>
         <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>復原（Ctrl+Shift+Z 重做）</td></tr>
       </table>
       <ul class="muted">
         <li>直接點影片上的字幕即可修改文字，Enter 完成、Shift+Enter 換行。</li>
-        <li>時間軸：拖曳字幕方塊移動，拖曳左右邊緣調整長度，雙擊空白處新增。</li>
+        <li>字幕框裡按 <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd> 從游標處拆成兩句（時間自動切）；在句首按 <kbd>Backspace</kbd> 併回上一句。</li>
+        <li>時間軸：拖曳字幕方塊移動、拖曳左右邊緣調整長度、雙擊空白處新增；在音軌上拖曳是框選範圍。</li>
         <li>時間軸滾輪捲動，Ctrl + 滾輪縮放。</li>
         <li>時間可輸入 <code>83.5</code>、<code>1:23.5</code>、<code>00:01:23,500</code> 或 <code>1分23秒</code>。</li>
       </ul>
