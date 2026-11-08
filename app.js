@@ -4,7 +4,7 @@
  * 影片字幕編輯器
  *  - 左上：影片（可直接點字幕編輯、可畫記）
  *  - 左下：時間軸（時間尺 / 字幕軌 / 音軌波形，可框選刪除片段）
- *  - 右側分頁：字幕校對、審片留言、刪除片段
+ *  - 右側分頁：字幕校正、審片留言、刪除片段
  * ========================================================= */
 
 const $ = (s) => document.querySelector(s);
@@ -286,7 +286,7 @@ function splitAt(t) {
   toast('已分割字幕');
 }
 
-/** 字幕校對：從游標位置把一句拆成兩句，時間依字數比例切開 */
+/** 字幕校正：從游標位置把一句拆成兩句，時間依字數比例切開 */
 function splitText(s, pos) {
   const text = s.text;
   const a = text.slice(0, pos).replace(/\s+$/, '');
@@ -312,7 +312,7 @@ function splitText(s, pos) {
   focusItemText(tail.id, 0);
 }
 
-/** 字幕校對：把這句併回上一句 */
+/** 字幕校正：把這句併回上一句 */
 function mergeWithPrev(s) {
   const i = state.subs.indexOf(s);
   if (i <= 0) return;
