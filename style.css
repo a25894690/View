@@ -61,7 +61,7 @@ body {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
+  grid-template-columns: minmax(0, 1fr) 400px;
 }
 .left {
   display: grid;
@@ -397,3 +397,41 @@ select {
 }
 .swatch.active { border-color: #fff; box-shadow: 0 0 0 2px #000 inset; }
 #drawBtn.on, #drawBtn2.on { background: #ffb800; color: #1a1a1a; border-color: #ffb800; }
+
+/* =========================================================
+ * v3：部分文字變色、單句位置大小
+ * ========================================================= */
+.sub-item .mini.on { background: var(--accent2); border-color: var(--accent2); }
+.sub-item .mini.has:not(.on) { border-color: var(--accent2); }
+.sub-item .preview {
+  font-size: 13px; padding: 3px 7px; border-radius: 4px;
+  background: #0d0f13; color: #fff; white-space: pre-wrap; word-break: break-word;
+}
+.sub-item .preview[hidden] { display: none; }
+.sub-item .panel {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 7px 8px; border: 1px dashed #4a5160; border-radius: 6px;
+  background: #191c22; font-size: 12px; color: var(--muted);
+}
+.color-panel input[type=color] { width: 26px; height: 22px; padding: 0; border: 1px solid var(--line); border-radius: 4px; background: none; cursor: pointer; }
+.layout-panel label { display: flex; align-items: center; gap: 8px; width: 100%; }
+.layout-panel .lab { width: 30px; }
+.layout-panel input[type=range] { flex: 1; }
+.layout-panel .val { width: 40px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+.layout-panel .panel-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; }
+
+.sub-handle {
+  position: absolute; z-index: 2;
+  width: 22px; height: 22px; border-radius: 50%;
+  display: none; align-items: center; justify-content: center;
+  background: #ffb800; color: #1a1a1a; font-size: 13px; line-height: 1;
+  cursor: move; pointer-events: auto; touch-action: none; user-select: none;
+  box-shadow: 0 1px 4px rgba(0,0,0,.6);
+}
+.sub-handle.show { display: flex; }
+.drawing .sub-handle { display: none; }
+/* 字幕列按鈕變多，縮窄一點避免被擠出去 */
+.sub-item .row { gap: 3px; }
+.sub-item .idx { width: 24px; flex: none; }
+.sub-item input.t { width: 80px; padding: 3px 4px; flex: none; }
+.sub-item .mini { padding: 0 4px; flex: none; }

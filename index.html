@@ -32,6 +32,7 @@
         <div class="sub-layer" id="subLayer">
           <div class="sub-overlay" id="subOverlay" contenteditable="true" spellcheck="false"
                data-placeholder="點這裡在目前時間新增字幕"></div>
+          <div class="sub-handle" id="subHandle" title="拖曳移動這句字幕的位置">✥</div>
         </div>
         <canvas class="draw-layer" id="drawCanvas"></canvas>
         <div class="draw-bar" id="drawBar" hidden>
@@ -200,6 +201,8 @@
       <ul class="muted">
         <li>直接點影片上的字幕即可修改文字，Enter 完成、Shift+Enter 換行。</li>
         <li>字幕框裡按 <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd> 從游標處拆成兩句（時間自動切）；在句首按 <kbd>Backspace</kbd> 併回上一句。</li>
+        <li>字幕列表的 🎨：先在字幕框選取幾個字，再點顏色，只有那幾個字會變色。</li>
+        <li>字幕列表的 🎯：調整這一句的大小和位置；暫停時也可以直接拖曳影片上字幕左邊的 ✥。</li>
         <li>時間軸：拖曳字幕方塊移動、拖曳左右邊緣調整長度、雙擊空白處新增；在音軌上拖曳是框選範圍。</li>
         <li>時間軸滾輪捲動，Ctrl + 滾輪縮放。</li>
         <li>時間可輸入 <code>83.5</code>、<code>1:23.5</code>、<code>00:01:23,500</code> 或 <code>1分23秒</code>。</li>

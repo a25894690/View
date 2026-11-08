@@ -167,11 +167,77 @@ function subAt(t) {
 function maxTime() { return state.duration || Infinity; }
 const isEdited = (s) => s.orig !== undefined && s.orig !== s.text;
 
-/** 改字幕文字，第一次修改時保留原文以便對照 */
+/** 改字幕文字，第一次修改時保留原文以便對照；變色範圍跟著文字位移 */
 function setText(s, text) {
   if (s.orig === undefined && s.text !== '' && s.text !== text) s.orig = s.text;
+  remapColors(s, s.text, text);
   s.text = text;
 }
+
+/* ---------------- 部分文字變色 ---------------- */
+// s.colors = [{ start, end, color }]，start/end 為字串索引
+
+/** 文字被編輯後，依「相同開頭 / 相同結尾」推算變色範圍的新位置 */
+function remapColors(s, oldText, newText) {
+  if (!s.colors?.length || oldText === newText) return;
+  const ol = oldText.length;
+  const nl = newText.length;
+  let p = 0;
+  while (p < ol && p < nl && oldText[p] === newText[p]) p++;
+  let q = 0;
+  while (q < ol - p && q < nl - p && oldText[ol - 1 - q] === newText[nl - 1 - q]) q++;
+  const oEnd = ol - q;
+  const delta = nl - ol;
+  const map = (pos, isEnd) => (pos <= p ? pos : pos >= oEnd ? pos + delta : isEnd ? nl - q : p);
+  setColors(s, s.colors.map((r) => ({ ...r, start: map(r.start, false), end: map(r.end, true) })));
+}
+
+function setColors(s, list) {
+  const out = list
+    .map((r) => ({ start: Math.max(0, r.start), end: r.end, color: r.color }))
+    .filter((r) => r.end > r.start)
+    .sort((a, b) => a.start - b.start);
+  if (out.length) s.colors = out; else delete s.colors;
+}
+
+/** 把 [a, b) 改成某個顏色（color 為 null 表示清除顏色） */
+function applyColor(s, a, b, color) {
+  const out = [];
+  for (const r of s.colors || []) {
+    if (r.end <= a || r.start >= b) { out.push(r); continue; }
+    if (r.start < a) out.push({ ...r, end: a });
+    if (r.end > b) out.push({ ...r, start: b });
+  }
+  if (color) out.push({ start: a, end: b, color });
+  setColors(s, out);
+}
+
+/** 取出 [from, to) 範圍內的變色，並位移 shift */
+function sliceColors(colors, from, to, shift) {
+  return (colors || [])
+    .map((r) => ({ ...r, start: Math.max(r.start, from) + shift, end: Math.min(r.end, to) + shift }))
+    .filter((r) => r.end > r.start);
+}
+
+/** 把字幕切成 [{ text, color }] 片段 */
+function segments(s) {
+  const text = s.text;
+  if (!s.colors?.length) return [{ text, color: null }];
+  const colorAt = new Array(text.length).fill(null);
+  for (const r of s.colors) for (let i = r.start; i < Math.min(r.end, text.length); i++) colorAt[i] = r.color;
+  const out = [];
+  let i = 0;
+  while (i < text.length) {
+    let j = i;
+    while (j < text.length && colorAt[j] === colorAt[i]) j++;
+    out.push({ text: text.slice(i, j), color: colorAt[i] });
+    i = j;
+  }
+  return out;
+}
+
+const hasLayout = (s) => s.x != null || s.y != null || s.size != null;
+const isStyled = (s) => !!s.colors?.length || hasLayout(s);
 
 /** 在 t 開始的新字幕預設結束時間：預設長度，但不超過下一條字幕或影片結尾 */
 function defaultEnd(t) {
@@ -210,6 +276,8 @@ function splitAt(t) {
   pushUndo();
   const tail = { id: nextId++, start: t, end: s.end, text: s.text };
   if (s.orig !== undefined) tail.orig = s.orig;
+  if (s.colors) tail.colors = s.colors.map((r) => ({ ...r }));
+  for (const k of ['x', 'y', 'size']) if (s[k] != null) tail[k] = s[k];
   s.end = t;
   state.subs.push(tail);
   sortSubs();
@@ -230,6 +298,10 @@ function splitText(s, pos) {
   const t = Math.min(s.end - MIN_LEN, Math.max(s.start + MIN_LEN, s.start + (s.end - s.start) * ratio));
   const orig = s.orig ?? text;
   const tail = { id: nextId++, start: t, end: s.end, text: b, orig };
+  const bOffset = text.length - b.length;
+  setColors(tail, sliceColors(s.colors, bOffset, text.length, -bOffset));
+  for (const k of ['x', 'y', 'size']) if (s[k] != null) tail[k] = s[k];
+  setColors(s, sliceColors(s.colors, 0, a.length, 0));
   s.end = t;
   s.text = a;
   s.orig = orig;
@@ -253,6 +325,7 @@ function mergeWithPrev(s) {
   const so = s.orig ?? s.text;
   // 兩句是同一句拆出來的（原文相同）→ 原文不重複
   const orig = prev.orig !== undefined && prev.orig === s.orig ? po : po + latin(po, so) + so;
+  setColors(prev, [...(prev.colors || []), ...sliceColors(s.colors, 0, s.text.length, caret)]);
   prev.text = prev.text + sep + s.text;
   prev.end = Math.max(prev.end, s.end);
   if (orig !== prev.text) prev.orig = orig; else delete prev.orig;
@@ -476,6 +549,8 @@ function load() {
       state.subs = data.subs.filter((s) => num(s.start) && num(s.end)).map((s) => {
         const o = { id: nextId++, start: +s.start, end: +s.end, text: String(s.text ?? '') };
         if (typeof s.orig === 'string') o.orig = s.orig;
+        if (Array.isArray(s.colors)) setColors(o, s.colors.filter((r) => num(r.start) && num(r.end) && typeof r.color === 'string'));
+        for (const k of ['x', 'y', 'size']) if (num(s[k])) o[k] = +s[k];
         return o;
       });
       sortSubs();
@@ -531,6 +606,14 @@ function renderList() {
         el('input', { className: 't', value: fmt(s.end), title: '結束時間', dataset: { field: 'end' } }),
         el('button', { type: 'button', className: 'mini', title: '結束 = 目前時間', textContent: '⏱', dataset: { act: 'setEnd' } }),
         el('span', { className: 'spacer' }),
+        el('button', {
+          type: 'button', className: 'mini' + (openPanel(s.id, 'color') ? ' on' : '') + (s.colors ? ' has' : ''),
+          title: '讓某幾個字變色', textContent: '🎨', dataset: { act: 'color' },
+        }),
+        el('button', {
+          type: 'button', className: 'mini' + (openPanel(s.id, 'layout') ? ' on' : '') + (hasLayout(s) ? ' has' : ''),
+          title: '調整這句的位置和大小', textContent: '🎯', dataset: { act: 'layout' },
+        }),
         el('button', { type: 'button', className: 'mini', title: '跳到這句', textContent: '▶', dataset: { act: 'jump' } }),
         el('button', { type: 'button', className: 'mini danger', title: '刪除', textContent: '✕', dataset: { act: 'del' } }),
       ),
@@ -538,7 +621,10 @@ function renderList() {
         rows: 1, value: s.text, placeholder: '輸入字幕…', dataset: { field: 'text' },
         title: 'Ctrl/⌘+Enter：從游標處拆句　句首 Backspace：併回上一句',
       }),
+      renderPreview(s),
       el('div', { className: 'orig', textContent: s.orig ?? '', hidden: !edited, title: '修改前的原文' }),
+      openPanel(s.id, 'color') ? colorPanel() : '',
+      openPanel(s.id, 'layout') ? layoutPanel(s) : '',
     );
     frag.append(item);
   });
@@ -549,6 +635,112 @@ function renderList() {
 
 function itemEl(id) { return listEl.querySelector(`.sub-item[data-id="${id}"]`); }
 
+/* ---- 🎨 / 🎯 面板 ---- */
+
+let panelState = null; // { id, kind: 'color' | 'layout' }
+const openPanel = (id, kind) => panelState?.id === id && panelState.kind === kind;
+
+const PALETTE = [
+  ['#ffd600', '黃'], ['#ff4d4f', '紅'], ['#b6ff3b', '綠'], ['#4fc3ff', '藍'], ['#ff8a3d', '橘'], ['#ff6ad5', '粉'],
+];
+
+/** 有變色的句子，在文字框下方顯示彩色預覽 */
+function renderPreview(s) {
+  const div = el('div', { className: 'preview', hidden: !s.colors, title: '變色預覽' });
+  if (s.colors) {
+    for (const seg of segments(s)) {
+      div.append(seg.color ? el('span', { textContent: seg.text, style: `color:${seg.color}` }) : seg.text);
+    }
+  }
+  return div;
+}
+
+function colorPanel() {
+  return el('div', { className: 'panel color-panel' },
+    el('span', { textContent: '選取上面的字，再點顏色：' }),
+    ...PALETTE.map(([c, name]) => el('button', {
+      type: 'button', className: 'swatch', title: name, style: `--c:${c}`, dataset: { act: 'paint', color: c },
+    })),
+    el('input', { type: 'color', value: '#ffd600', title: '自訂顏色', dataset: { act: 'paintCustom' } }),
+    el('button', { type: 'button', className: 'btn small', textContent: '清除顏色', dataset: { act: 'unpaint' }, title: '有選取就清除選取部分，沒選取就清除整句' }),
+  );
+}
+
+function layoutPanel(s) {
+  const st = state.style;
+  const vals = {
+    size: s.size ?? st.size,
+    x: Math.round((s.x ?? 0.5) * 100),
+    y: Math.round((s.y ?? st.pos / 100) * 100),
+  };
+  const row = (key, label, min, max, step, unit) => el('label', {},
+    el('span', { className: 'lab', textContent: label }),
+    el('input', { type: 'range', min, max, step, value: vals[key], dataset: { lay: key } }),
+    el('span', { className: 'val', textContent: vals[key] + unit }),
+  );
+  return el('div', { className: 'panel layout-panel' },
+    row('size', '大小', 2, 15, 0.5, '%'),
+    row('x', '左右', 0, 100, 1, '%'),
+    row('y', '離底', 0, 90, 1, '%'),
+    el('div', { className: 'panel-foot' },
+      el('span', { textContent: '也可以暫停後直接在影片上拖曳字幕旁的 ✥ 移動' }),
+      el('button', { type: 'button', className: 'btn small', textContent: '重設', dataset: { act: 'resetLayout' } }),
+    ),
+  );
+}
+
+function togglePanel(s, kind) {
+  panelState = openPanel(s.id, kind) ? null : { id: s.id, kind };
+  if (panelState) {
+    // 讓影片停在這句，方便看效果
+    video.pause();
+    if (subAt(video.currentTime) !== s) seek(s.start + 0.001);
+  }
+  renderList();
+  itemEl(s.id)?.scrollIntoView({ block: 'nearest' });
+}
+
+function paintSelection(s, color) {
+  const ta = itemEl(s.id)?.querySelector('textarea');
+  if (!ta) return;
+  const a = ta.selectionStart;
+  const b = ta.selectionEnd;
+  if (color && a === b) return toast('先在字幕框裡選取要變色的字');
+  pushUndo();
+  if (a === b) delete s.colors;
+  else applyColor(s, a, b, color);
+  if (subAt(video.currentTime) !== s) { video.pause(); seek(s.start + 0.001); }
+  changed();
+  const nta = itemEl(s.id)?.querySelector('textarea');
+  if (nta) { nta.focus(); nta.setSelectionRange(a, b); }
+}
+
+let layoutUndoPending = false;
+listEl.addEventListener('pointerdown', (e) => { if (e.target.dataset.lay) layoutUndoPending = true; });
+listEl.addEventListener('input', (e) => {
+  const key = e.target.dataset.lay;
+  if (!key) return;
+  const s = byId(+e.target.closest('.sub-item').dataset.id);
+  if (!s) return;
+  if (layoutUndoPending) { pushUndo(); layoutUndoPending = false; }
+  const v = +e.target.value;
+  if (key === 'size') s.size = v; else s[key] = v / 100;
+  e.target.nextElementSibling.textContent = v + '%';
+  if (subAt(video.currentTime) !== s) { video.pause(); seek(s.start + 0.001); }
+  state.activeId = -1;
+  dirty = true;
+  save();
+});
+listEl.addEventListener('change', (e) => {
+  if (e.target.dataset.lay) { layoutUndoPending = true; renderListSoon(); }
+  if (e.target.dataset.act === 'paintCustom') {
+    const s = byId(+e.target.closest('.sub-item').dataset.id);
+    if (s) paintSelection(s, e.target.value);
+  }
+});
+let renderTimer = 0;
+function renderListSoon() { clearTimeout(renderTimer); renderTimer = setTimeout(() => { renderList(); updateCounts(); }, 400); }
+
 /** 只更新某一條的「已修改」顯示，不重繪整個列表 */
 function refreshEdited(s) {
   const it = itemEl(s.id);
@@ -558,6 +750,7 @@ function refreshEdited(s) {
   const o = it.querySelector('.orig');
   o.hidden = !edited;
   o.textContent = s.orig ?? '';
+  it.querySelector('.preview')?.replaceWith(renderPreview(s));
 }
 
 function select(id, { scroll = true } = {}) {
@@ -585,6 +778,18 @@ listEl.addEventListener('click', (e) => {
   else if (act === 'del') deleteSub(id);
   else if (act === 'setStart') setEdge(s, 'start', video.currentTime);
   else if (act === 'setEnd') setEdge(s, 'end', video.currentTime);
+  else if (act === 'color' || act === 'layout') togglePanel(s, act);
+  else if (act === 'paint') paintSelection(s, e.target.dataset.color);
+  else if (act === 'unpaint') paintSelection(s, null);
+  else if (act === 'resetLayout') {
+    pushUndo();
+    delete s.x; delete s.y; delete s.size;
+    changed();
+  }
+});
+// 點色塊時不要讓文字框失去選取
+listEl.addEventListener('mousedown', (e) => {
+  if (e.target.dataset.act === 'paint' || e.target.dataset.act === 'unpaint') e.preventDefault();
 });
 
 let textEditPending = false;
@@ -700,6 +905,7 @@ function updateOverlay() {
   const s = subAt(video.currentTime);
   const id = s ? s.id : null;
   if (id === state.activeId && (!s || overlay.textContent === s.text)) return;
+  placeOverlay(s);
 
   // 列表高亮
   listEl.querySelector('.sub-item.active')?.classList.remove('active');
@@ -710,7 +916,10 @@ function updateOverlay() {
       it.classList.add('active');
       if (!video.paused && !listEl.contains(document.activeElement)) it.scrollIntoView({ block: 'nearest' });
     }
-    overlay.textContent = s.text;
+    overlay.textContent = '';
+    for (const seg of segments(s)) {
+      overlay.append(seg.color ? el('span', { textContent: seg.text, style: `color:${seg.color}` }) : seg.text);
+    }
     overlay.classList.remove('empty');
     overlay.classList.toggle('hidden', s.text === '' && !video.paused);
   } else {
@@ -731,7 +940,63 @@ function applyOverlayStyle() {
   overlay.style.textShadow = st.outline
     ? '0 0 2px #000, 0 0 2px #000, 1px 1px 2px #000, -1px -1px 2px #000'
     : 'none';
+  placeOverlay(subAt(video.currentTime));
 }
+
+/** 每句字幕可以有自己的位置和大小（沒設定就用全域樣式） */
+function placeOverlay(s) {
+  const st = state.style;
+  const h = parseFloat(subLayer.style.height) || player.clientHeight;
+  overlay.style.fontSize = ((s?.size ?? st.size) / 100) * h + 'px';
+  overlay.style.bottom = (s?.y ?? st.pos / 100) * h + 'px';
+  overlay.style.left = (s?.x ?? 0.5) * 100 + '%';
+}
+
+/* ---- 在影片上拖曳字幕位置 ---- */
+
+const handle = $('#subHandle');
+let handleDrag = null;
+
+function positionHandle() {
+  const s = subAt(video.currentTime);
+  const show = !!(video.src && video.paused && s && s.text && !state.drawMode && !exporting &&
+    !overlay.classList.contains('hidden') && document.activeElement !== overlay) || !!handleDrag;
+  handle.classList.toggle('show', show);
+  if (!show) return;
+  const lr = subLayer.getBoundingClientRect();
+  const or = overlay.getBoundingClientRect();
+  handle.style.left = or.left - lr.left - 26 + 'px';
+  handle.style.top = or.top - lr.top + or.height / 2 - 11 + 'px';
+}
+
+handle.addEventListener('pointerdown', (e) => {
+  const s = subAt(video.currentTime);
+  if (!s) return;
+  e.preventDefault();
+  handle.setPointerCapture(e.pointerId);
+  pushUndo();
+  const or = overlay.getBoundingClientRect();
+  handleDrag = { s, offX: e.clientX - (or.left + or.width / 2), offY: e.clientY - or.bottom };
+  select(s.id);
+});
+handle.addEventListener('pointermove', (e) => {
+  if (!handleDrag) return;
+  const { s, offX, offY } = handleDrag;
+  const lr = subLayer.getBoundingClientRect();
+  let x = (e.clientX - offX - lr.left) / lr.width;
+  if (Math.abs(x - 0.5) < 0.02) x = 0.5; // 靠近中間自動置中
+  const y = (lr.bottom - (e.clientY - offY)) / lr.height;
+  s.x = Math.round(Math.max(0, Math.min(1, x)) * 1000) / 1000;
+  s.y = Math.round(Math.max(0, Math.min(0.95, y)) * 1000) / 1000;
+  placeOverlay(s);
+});
+const endHandle = () => {
+  if (!handleDrag) return;
+  handleDrag = null;
+  changed();
+};
+handle.addEventListener('pointerup', endHandle);
+handle.addEventListener('pointercancel', endHandle);
 
 /** 讓字幕層、畫記層剛好蓋在影片實際畫面上（扣掉黑邊） */
 function layoutOverlay() {
@@ -1033,6 +1298,20 @@ function reviewText({ images }) {
     edited.forEach((s, i) => L.push(`${i + 1}. [${fmtShort(s.start)} — ${fmtShort(s.end)}] 「${s.orig}」→「${s.text}」`));
   }
 
+  const styled = state.subs.filter(isStyled);
+  if (styled.length) {
+    L.push('', '## 字幕樣式調整', '');
+    styled.forEach((s, i) => {
+      const parts = [];
+      for (const r of s.colors || []) parts.push(`「${s.text.slice(r.start, r.end)}」變色 ${r.color}`);
+      if (s.size != null) parts.push(`字體大小 ${s.size}%`);
+      if (s.x != null || s.y != null) {
+        parts.push(`位置 左右 ${Math.round((s.x ?? 0.5) * 100)}%、離底 ${Math.round((s.y ?? state.style.pos / 100) * 100)}%`);
+      }
+      L.push(`${i + 1}. [${fmtShort(s.start)}] 「${s.text.replace(/\n/g, ' ')}」：${parts.join('；')}`);
+    });
+  }
+
   if (images) {
     const withImg = state.notes.filter((n) => n.thumb);
     if (withImg.length) {
@@ -1049,7 +1328,7 @@ function reviewText({ images }) {
 }
 
 function hasReview() {
-  return state.notes.length || state.cuts.length || state.subs.some(isEdited);
+  return state.notes.length || state.cuts.length || state.subs.some((s) => isEdited(s) || isStyled(s));
 }
 
 $('#exportMd').addEventListener('click', () => {
@@ -1645,10 +1924,33 @@ function parseSubs(text) {
     const start = parseTime(a.trim());
     const end = parseTime(b.trim().split(/\s+/)[0]);
     if (!isFinite(start) || !isFinite(end)) continue;
-    const body = lines.slice(i + 1).join('\n').replace(/<[^>]+>/g, '').replace(/\{\\[^}]*\}/g, '').trim();
-    out.push({ start, end: Math.max(end, start + MIN_LEN), text: body });
+    const { text: body, colors } = parseTagged(lines.slice(i + 1).join('\n').trim());
+    const sub = { start, end: Math.max(end, start + MIN_LEN), text: body };
+    if (colors.length) sub.colors = colors;
+    out.push(sub);
   }
   return out;
+}
+
+/** 解析字幕裡的 <font color="..."> 標籤，其他標籤忽略 */
+function parseTagged(raw) {
+  let text = '';
+  const colors = [];
+  const stack = [];
+  for (const tok of raw.split(/(<[^>]+>|\{\\[^}]*\})/)) {
+    if (!tok) continue;
+    if (tok[0] === '<') {
+      const m = tok.match(/^<font[^>]*color\s*=\s*["']?([^"'\s>]+)/i);
+      if (m) stack.push(m[1]);
+      else if (/^<\/font/i.test(tok)) stack.pop();
+      continue;
+    }
+    if (tok.startsWith('{\\')) continue;
+    const col = stack[stack.length - 1];
+    if (col) colors.push({ start: text.length, end: text.length + tok.length, color: col });
+    text += tok;
+  }
+  return { text, colors };
 }
 
 async function loadSubFile(file) {
@@ -1711,9 +2013,13 @@ function subsForExport() {
     .filter((s) => s.end - s.start >= 0.05);
 }
 
+/** SRT 支援 <font color>，部分變色會一起匯出 */
+function taggedText(s) {
+  return segments(s).map((g) => (g.color ? `<font color="${g.color}">${g.text}</font>` : g.text)).join('');
+}
 function toSRT(list = state.subs) {
   return list.map((s, i) =>
-    `${i + 1}\n${fmtFile(s.start, ',')} --> ${fmtFile(s.end, ',')}\n${s.text}\n`).join('\n');
+    `${i + 1}\n${fmtFile(s.start, ',')} --> ${fmtFile(s.end, ',')}\n${taggedText(s)}\n`).join('\n');
 }
 function toVTT(list = state.subs) {
   return 'WEBVTT\n\n' + list.map((s) =>
@@ -1736,50 +2042,71 @@ function hexA(hex, a) {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 
-/** 把字幕畫到 canvas 上（與影片上的預覽樣式一致） */
-function drawSubtitle(c, text, W, H) {
+/** 把字幕畫到 canvas 上（與影片上的預覽樣式一致，含部分變色、單句位置大小） */
+function drawSubtitle(c, s, W, H) {
+  const text = s.text;
   if (!text) return;
   const st = state.style;
-  const size = (st.size / 100) * H;
+  const size = ((s.size ?? st.size) / 100) * H;
   c.font = `${st.bold ? 700 : 400} ${size}px system-ui, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif`;
-  c.textAlign = 'center';
+  c.textAlign = 'left';
   c.textBaseline = 'middle';
+
+  const colorAt = new Array(text.length).fill(null);
+  for (const r of s.colors || []) for (let i = r.start; i < Math.min(r.end, text.length); i++) colorAt[i] = r.color;
+  const str = (arr) => arr.map((o) => o.ch).join('');
+  const width = (arr) => c.measureText(str(arr)).width;
+
+  // 斷行：保留每個字的顏色
   const maxW = W * 0.9 - size;
   const lines = [];
-  for (const raw of text.split('\n')) {
-    let line = '';
-    for (const ch of raw) {
-      if (line && c.measureText(line + ch).width > maxW) {
-        // 英文盡量在空白處斷行
-        const sp = line.lastIndexOf(' ');
-        if (/\w/.test(ch) && sp > 0) { lines.push(line.slice(0, sp)); line = line.slice(sp + 1) + ch; }
-        else { lines.push(line); line = ch; }
-      } else line += ch;
-    }
-    lines.push(line);
+  let line = [];
+  let idx = 0;
+  for (const ch of text) {
+    const color = colorAt[idx];
+    idx += ch.length;
+    if (ch === '\n') { lines.push(line); line = []; continue; }
+    const cand = [...line, { ch, color }];
+    if (line.length && width(cand) > maxW) {
+      // 英文盡量在空白處斷行
+      let sp = -1;
+      for (let k = line.length - 1; k >= 0; k--) if (line[k].ch === ' ') { sp = k; break; }
+      if (/\w/.test(ch) && sp > 0) { lines.push(line.slice(0, sp)); line = [...line.slice(sp + 1), { ch, color }]; }
+      else { lines.push(line); line = [{ ch, color }]; }
+    } else line = cand;
   }
+  lines.push(line);
+
   const lh = size * 1.25;
   const padX = size * 0.5;
   const padY = size * 0.15;
-  const boxW = Math.max(...lines.map((l) => c.measureText(l).width)) + padX * 2;
+  const boxW = Math.max(...lines.map(width)) + padX * 2;
   const boxH = lh * lines.length + padY * 2;
-  const bottom = H - (st.pos / 100) * H;
-  const top = bottom - boxH;
+  const cx = Math.max(boxW / 2, Math.min(W - boxW / 2, (s.x ?? 0.5) * W));
+  const bottom = H - (s.y ?? st.pos / 100) * H;
+  const top = Math.max(0, bottom - boxH);
   if (st.bgA > 0) {
     c.fillStyle = hexA(st.bg, st.bgA);
-    roundRect(c, W / 2 - boxW / 2, top, boxW, boxH, size * 0.2);
+    roundRect(c, cx - boxW / 2, top, boxW, boxH, size * 0.2);
     c.fill();
   }
-  lines.forEach((l, i) => {
+  lines.forEach((ln, i) => {
     const y = top + padY + lh * (i + 0.5);
+    const x0 = cx - width(ln) / 2;
     if (st.outline) {
       c.lineJoin = 'round';
       c.lineWidth = Math.max(2, size * 0.12);
       c.strokeStyle = '#000';
-      c.strokeText(l, W / 2, y);
+      c.strokeText(str(ln), x0, y);
     }
-    c.fillStyle = st.color;
-    c.fillText(l, W / 2, y);
+    let k = 0;
+    while (k < ln.length) {
+      let j = k;
+      while (j < ln.length && ln[j].color === ln[k].color) j++;
+      c.fillStyle = ln[k].color || st.color;
+      c.fillText(str(ln.slice(k, j)), x0 + width(ln.slice(0, k)), y);
+      k = j;
+    }
   });
 }
 
@@ -1840,7 +2167,7 @@ async function exportBurned() {
   const drawFrame = () => {
     c.drawImage(video, 0, 0, W, H);
     const s = subAt(video.currentTime);
-    if (s) drawSubtitle(c, s.text, W, H);
+    if (s) drawSubtitle(c, s, W, H);
     const outT = mapTime(video.currentTime);
     const p = outTotal ? Math.min(1, outT / outTotal) : 0;
     prog.value = p;
@@ -2069,6 +2396,7 @@ function tick() {
     dirty = false;
   }
   updateOverlay();
+  positionHandle();
   updateNoteHead();
   const label = fmt(video.currentTime) + ' / ' + fmt(state.duration);
   if (label !== lastLabel) { timeLabel.textContent = label; lastLabel = label; }
@@ -2090,4 +2418,4 @@ layoutOverlay();
 requestAnimationFrame(tick);
 
 // 方便測試 / 除錯
-window.__editor = { state, parseTime, parseSubs, toSRT, toVTT, fmt, mapTime, reviewText, cutStats };
+window.__editor = { state, parseTime, parseSubs, toSRT, toVTT, fmt, mapTime, reviewText, cutStats, segments };
